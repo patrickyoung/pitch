@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Never quiet</title>
+<body>
+  <main><h1>Loading</h1><button id="b">Retry</button></main>
+<script type="module">
+  // A page that keeps talking never goes quiet, so "the load event fired and
+  // nothing is in flight" is only half the answer. The deadline is the other
+  // half, and reaching it is a failure, not a pass.
+  setInterval(() => { fetch('./ping.txt?' + Math.random()).catch(() => {}); }, 60);
+</script>

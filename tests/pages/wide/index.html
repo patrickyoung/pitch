@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; color: #111; background: #fff; margin: 0; }
+  /* The single most common way a generated page breaks on a phone: a fixed
+     width that was fine in the 1440px screenshot nobody scrolled sideways. */
+  .board { width: 900px; padding: 2rem; }
+</style>
+<body>
+  <main class="board">
+    <h1>Quarterly</h1>
+    <button id="b">Sort</button>
+  </main>
+<script type="module">
+  document.getElementById('b').addEventListener('click', e => {
+    e.target.textContent = e.target.textContent === 'Sort' ? 'Sorted' : 'Sort';
+  });
+</script>

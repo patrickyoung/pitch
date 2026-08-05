@@ -1,0 +1,895 @@
+#!/bin/sh
+# pitch -- describe a site, get a URL, keep building it.
+#
+#     pitch new clock "a wall clock with a seconds sweep, dark, no libraries"
+#     pitch say clock "make the hands thinner"
+#     pitch open clock          # public, over Funnel
+#     pitch ls
+#
+# Nothing is committed or served until page-check has exited 0 against it, so
+# a build happens in build/<name> and only a page that passed is ever moved
+# into sites/. A failed build leaves the last good page exactly where it was.
+set -eu
+
+# Follow symlinks before anything else. `ln -s bin/pitch ~/.local/bin/pitch`
+# is how this gets onto PATH, and $0 is then the link, whose parent has no
+# lib/ in it. This has to run before the source line, not after, which is why
+# it is here and inline rather than a function in the file being sourced.
+prog=$0
+while [ -L "$prog" ]; do
+	dir=$(dirname -- "$prog")
+	link=$(readlink -- "$prog")
+	case $link in
+	/*) prog=$link ;;
+	*) prog=$dir/$link ;;
+	esac
+done
+BIN=$(CDPATH= cd -- "$(dirname -- "$prog")" && pwd)
+. "$BIN/../lib/common.sh"
+# Two roots, and they are different questions. SELF is where the program's own
+# files are -- lib/, etc/toolbox, skills/ -- and it is always beside the
+# binary. ROOT is where the data is: sites/, build/, log/. They are the same
+# directory in the ordinary install and they are not the same in the suite,
+# which is how a missing etc/toolbox turned into an empty toolbox and no error.
+SELF=$(CDPATH= cd -- "$BIN/.." && pwd)
+ROOT=${PITCH_ROOT:-$SELF}
+load_config
+
+# Exported once, here, rather than as a prefix on each command that needs it.
+# A prefix does not reach a command substitution in that same command's
+# arguments -- the substitution is expanded first, in this shell -- so
+# `BRIEF_PATH=x ask -S "$(brief cat web-house)"` runs brief with no BRIEF_PATH
+# at all. That failed quietly for every `pitch new`: the call that writes the
+# spec was built without the doctrine in its system prompt, and said so on
+# stderr where nothing was reading. Prepended, so a caller's own path survives.
+BRIEF_PATH=$SELF/skills${BRIEF_PATH:+:$BRIEF_PATH}
+export BRIEF_PATH
+
+usage() {
+	cat >&2 <<'EOF'
+usage: pitch <command> [arguments]
+
+  new <name> <what you want>   build a site, prove it, and print its URL
+  say <name> <what to change>  change a site, prove it, commit it
+  slug <what you want>         a name for a description, on stdout
+  ls [-u <name>]               every site, or one site's URL
+  back <name>                  undo the last change (git revert)
+  land <name>                  fold this run of tweaks into one, rewrite the spec
+  drop <name>                  throw the whole run away, back to the last landing
+  open <name> | shut <name>    reachable from the internet, or not
+  up | down                    the static server and the tailscale config
+  reconcile                    make tailscale match the tree; idempotent
+  group <name> [chat-id]       give a site its own chat group
+  doctor                       what is wrong, before it is wrong
+EOF
+	exit 2
+}
+
+# ----------------------------------------------------------------- plumbing
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH$2"; }
+
+# The toolbox is derived, and it is derived here rather than installed by
+# `just link`, because the tree is a bind mount: the Mac and the container
+# share one directory and cannot share one set of symlinks. `node` is
+# /opt/homebrew/bin/node on one side and /usr/local/bin/node on the other, and
+# a toolbox built on the Mac is a toolbox of dangling links in the container --
+# which `ply -t` reports as a model that cannot find any program at all.
+#
+# So: one list in etc/toolbox, resolved against whatever PATH is real right
+# now. It costs a few symlinks per build and removes a whole class of "works
+# on my machine" from a system whose entire point is that it runs in two.
+toolbox() {
+	list=$SELF/etc/toolbox
+	[ -f "$list" ] || die "$list is missing, and it is the only list of what a build may run"
+	box=$ROOT/build/.tools
+	rm -rf "$box"
+	mkdir -p "$box"
+	missing=
+	while read -r t; do
+		t=${t%%#*}
+		t=$(printf '%s' "$t" | tr -d ' \t')
+		[ -n "$t" ] || continue
+		if [ "$t" = page-check ]; then
+			ln -sf "$BIN/page-check" "$box/$t"
+		elif w=$(command -v "$t" 2>/dev/null); then
+			ln -sf "$w" "$box/$t"
+		else
+			missing="$missing $t"
+		fi
+	done <"$list"
+	[ -n "$missing" ] && die "the toolbox is incomplete, so a build would be aimed at nothing:$missing"
+	# An empty toolbox is `ply -t` with nothing in it, which the model reports
+	# as having no tools rather than as an error. Say it here, loudly, once.
+	[ -n "$(ls -A "$box")" ] || die "$list named nothing -- the toolbox came out empty"
+	return 0
+}
+
+# One build per site, ever. Two messages a minute apart in the same group ran
+# concurrently on one staging path: the second's `rm -rf` deleted the first's
+# working tree out from under ply, and whichever finished last copied over the
+# other. heed serializes per gateway, but this handler forks and returns, so
+# that lock is released while the build is still running.
+#
+# mkdir(2) is the atomic primitive every Unix ships. The lock records a
+# timestamp and not a pid, because `$$` in a background subshell is the parent
+# shell's and staleness would then silently never fire -- hail paid for that.
+LOCKED=
+lock() {
+	d=$ROOT/state/$1.lock
+	mkdir -p "$ROOT/state"
+	if mkdir "$d" 2>/dev/null; then
+		date -u +%s >"$d/at"
+		LOCKED=$d
+		trap 'unlock' EXIT INT TERM
+		return 0
+	fi
+	age=$(($(date -u +%s) - $(cat "$d/at" 2>/dev/null || echo 0)))
+	# Written as an `if`, not as `[ ... ] && return 1`. Under `set -e` a
+	# trailing AND-list whose test fails is a failed command at statement
+	# level, and the shell exits -- so the stale-lock path killed the program
+	# instead of breaking the lock. The same shape bit landed_base below.
+	if [ "$age" -le "${PITCH_LOCK_STALE:-1800}" ]; then
+		return 1
+	fi
+	# Older than any build could be. Whoever held it is gone.
+	rm -rf "$d"
+	lock "$1"
+}
+unlock() {
+	[ -n "${LOCKED:-}" ] && rm -rf "$LOCKED"
+	LOCKED=
+	return 0
+}
+
+# The commit a run of tweaks is measured from: the last landing, or the very
+# first commit if there has never been one. git holds the asks -- every accepted
+# change is a commit whose message is what was asked for -- so there is no
+# second record to keep and none is kept.
+landed_base() {
+	if tag=$(git -C "$1" rev-parse -q --verify 'landed^{commit}' 2>/dev/null); then
+		printf '%s\n' "$tag"
+		return 0
+	fi
+	git -C "$1" rev-list --max-parents=0 HEAD 2>/dev/null | tail -1
+}
+
+site_dir() {
+	valid_name "$1" || die "\"$1\" is not a site name: lowercase letters, digits and dashes, starting with a letter, at most 32"
+	printf '%s/sites/%s\n' "$ROOT" "$1"
+}
+
+# Serve the staging tree on a port nobody chose, so two builds cannot collide
+# and neither touches the live server. The port comes back in a file because
+# asking for a fixed one is a race the second build always loses.
+staging_up() {
+	PORTFILE=$(mktemp "${TMPDIR:-/tmp}/pitch-port.XXXXXX")
+	PIDFILE=$PORTFILE.pid
+	# Started inside a subshell that exits at once, so this shell never owns
+	# it as a job and never prints its obituary. `Terminated: 15` on the line
+	# after a successful build reads like a failure, and the last line of a
+	# build is the URL.
+	( PITCH_PORT_FILE=$PORTFILE "$BIN/pitch-serve" -p 0 -r "$ROOT/build" >/dev/null 2>&1 &
+	  printf '%s' "$!" >"$PIDFILE" )
+	n=0
+	while [ ! -s "$PORTFILE" ]; do
+		n=$((n + 1))
+		[ "$n" -gt 100 ] && { staging_down; die "the staging server never started"; }
+		sleep 0.1
+	done
+	STAGE_PORT=$(cat "$PORTFILE")
+}
+
+staging_down() {
+	[ -s "${PIDFILE:-}" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+	rm -f "${PORTFILE:-}" "${PIDFILE:-}"
+	PORTFILE=; PIDFILE=
+	return 0
+}
+
+# The whole loop. ply drives until page-check exits 0 against the staging URL,
+# and page-check is a program, so exit 0 is its opinion and not the model's.
+#
+# The goal is a constant and the wanted change arrives on stdin. A chat message
+# beginning with `-` would otherwise become a flag, and nothing here ever lets
+# untrusted text be re-parsed by a shell.
+work() {
+	name=$1 goal=$2
+	toolbox
+	staging_up
+	url="http://127.0.0.1:$STAGE_PORT/$name/"
+	set +e
+	# ${PLY:-ply} is the family's convention and it is what makes this
+	# checkable with no model and no network: the suite puts a stub on that
+	# name and exercises everything around the loop without entering it.
+	#
+	# -compact is what stops a long build dying of its own transcript. Without
+	# it a window that fills is exit 2 -- "not done" -- and the work is lost at
+	# the point it was closest to finished, which is the most expensive moment
+	# available. Two compactions, then it gives up honestly.
+	#
+	# -B is not optional, and the reason is the whole shape of an edit. ply
+	# runs the check *before* the first turn and stops if it passes, which is
+	# exactly right for "make the tests pass" and exactly wrong here: the live
+	# page already passes, so a change would be answered with `nothing to do`
+	# and the URL, forever. The check can say a page is well made; it cannot
+	# say it is the page that was asked for. That gap is real and is named in
+	# DESIGN.md rather than papered over.
+	#
+	# The two assignments are a command *prefix*, so nothing may come between
+	# them and the command -- not even a comment. A comment after a trailing
+	# backslash turns them into plain shell variables, unexported, and the
+	# symptom is `brief: no skill "web-house"` a long way from the cause.
+	# A scratch directory outside the site, because most of the reason a
+	# screenshot ends up published is that there was nowhere else to put it.
+	mkdir -p "$ROOT/build/.scratch"
+	ASK_DIR=$ROOT/.ask \
+	TMPDIR=$ROOT/build/.scratch \
+	"${PLY:-ply}" -B \
+		-C "$ROOT/build/$name" \
+		-t "$ROOT/build/.tools" \
+		-s web-house \
+		-check "$BIN/page-check -timeout $PITCH_PAGE_TIMEOUT -budget $PITCH_BUDGET $url" \
+		-cycles "$PITCH_CYCLES" \
+		-timeout "$PITCH_CMD_TIMEOUT" \
+		-compact -compactions 2 \
+		${PITCH_MODEL:+-m "$PITCH_MODEL"} \
+		"$goal"
+	st=$?
+	set -e
+	staging_down
+	return $st
+}
+
+# What the model is told. The design is in SPEC.md rather than in argv because
+# ps(1) is world-readable and a description can be private, and because a file
+# is the thing a person edits when the model got it wrong.
+#
+# There are two goals, and having only one was a real bug. `Build the app
+# SPEC.md describes` is right for a new site and catastrophic for a change:
+# SPEC.md accumulates one "Asked for on" section per request, so by the fifth
+# edit the model is handed a changelog and told to build what it describes --
+# and it does, from scratch, every time. The clock's own history is the
+# evidence: `add the date` changed 81 lines of 308, and four requests later
+# `fix all the hands` changed 346 of 371. That is not an edit, it is a new app
+# wearing the same name, and it is why each request lost the last one's work.
+HOUSE='
+This directory is the published site. Every file left in it is served to
+whoever opens the URL, so leave nothing here that is not part of the app --
+no screenshots, no notes, no scratch output. $TMPDIR is for those.
+SPEC.md is the exception and it stays: it is the record of what was asked
+for, and every later conversation about this app begins by reading it.'
+
+GOAL="Read SPEC.md. Build the app it describes as index.html in this
+directory: one file, no build step, no package.json, no node_modules.
+Then run the check and fix whatever it names, until it passes.
+$HOUSE"
+
+EDIT_GOAL="index.html in this directory is a working app that already passes
+the check. It is the thing being edited, not a draft to replace.
+
+.change holds the one thing being asked for now. Read it, read index.html,
+and make the smallest edit that satisfies it.
+
+Do not rewrite the file. Everything the request does not name must come out
+byte for byte as it went in -- the same markup, the same class names, the same
+functions, the same look. If the request touches the hands of a clock, the
+face does not change.
+
+SPEC.md is background: it says what the app is, and its 'Asked for on'
+sections are work already done, not a list to redo. The app in front of you
+is the result of all of them.
+
+Then run the check and fix whatever it names, until it passes.
+$HOUSE"
+
+# SPEC.md is raw -- the record of what was asked for, and the thing no rerun
+# can reconstruct. So it is not left in the model's hands: a copy is kept
+# outside the staging tree and restored over whatever is there before the site
+# is published. The first real build with the "leave nothing here" rule in the
+# goal ended with the model dutifully deleting SPEC.md, which is a correct
+# reading of an instruction that was wrong. Instructions are advice; this is
+# the guard.
+spec_keep() { cp "$1/SPEC.md" "$ROOT/build/.spec"; }
+spec_restore() { cp "$ROOT/build/.spec" "$1/SPEC.md"; rm -f "$ROOT/build/.spec"; }
+
+# git refuses to commit without an identity, and a fresh container has none:
+# `unable to auto-detect email address (got 'root@2de3dc04d088.(none)')`. The
+# builder runs in exactly such a container, so a commit that depends on the
+# host's global config is a commit that works on the Mac and nowhere else.
+# Found the first time this suite ran on Linux, which is what running it there
+# is for. The host's identity wins when it has one; these commits are only
+# attributed to the machine when nothing else can be.
+commit() {
+	d=$1 m=$2
+	if git -C "$d" config user.email >/dev/null 2>&1; then
+		git -C "$d" commit -qm "$m"
+	else
+		git -C "$d" -c user.name=pitch -c user.email=pitch@localhost commit -qm "$m"
+	fi
+}
+
+record() {
+	printf '{"t":"%s","site":"%s","verdict":"%s","what":%s}' \
+		"$(now)" "$1" "$2" "$(printf '%s' "$3" | jq -Rs .)" | logappend "$1"
+}
+
+# ---------------------------------------------------------------- the verbs
+
+cmd_slug() {
+	[ $# -gt 0 ] || die "usage: pitch slug <what you want>"
+	need "${ASK:-ask}" ""
+	out=$(printf '%s' "$*" | ASK_DIR=$ROOT/.ask "${ASK:-ask}" -n -q ${PITCH_SMALL_MODEL:+-m "$PITCH_SMALL_MODEL"} \
+		'Answer with one word and nothing else: a name for the app described on
+		stdin. Lowercase letters, digits and dashes only, starting with a
+		letter, at most 20 characters, no explanation and no punctuation.')
+	slug=$(printf '%s' "$out" | tr -d '\n' | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9-]//g' | cut -c1-32 | sed 's/-*$//')
+	valid_name "$slug" || die "the model did not answer with a usable name (got \"$out\")"
+	printf '%s\n' "$slug"
+}
+
+cmd_new() {
+	[ $# -ge 2 ] || die "usage: pitch new <name> <what you want>"
+	name=$1; shift; want=$*
+	dir=$(site_dir "$name")
+	[ -e "$dir" ] && die "$name already exists -- pitch say $name \"...\" changes it"
+	need "${ASK:-ask}" ""; need "${PLY:-ply}" ""; need jq ""; need git ""
+	lock "$name" || die "$name is already being built"
+
+	stage=$ROOT/build/$name
+	rm -rf "$stage"
+	mkdir -p "$stage"
+
+	# One call, one document. Everything the build and every later
+	# conversation needs to agree about is settled here, before any code.
+	#
+	# The description rides on stdin rather than in argv: ps(1) is
+	# world-readable and what somebody wants built can be private. draft's
+	# design makes the same choice for the same reason.
+	printf '%s' "$want" | ASK_DIR=$ROOT/.ask \
+	"${ASK:-ask}" -n -q ${PITCH_SMALL_MODEL:+-m "$PITCH_SMALL_MODEL"} \
+		-S "$("${ASK:-ask}" system; brief cat web-house)" \
+		"Write SPEC.md for the single-file web app described on stdin. Output
+		the markdown and nothing else, in exactly this shape:
+
+		# $name
+
+		<one sentence saying what it is, for somebody who has not read this>
+
+		## What it must do
+		- [ ] <a statement somebody could check by using the app>
+		- [ ] <five to nine of these, behaviour only, no implementation>
+
+		## Notes
+		<anything the description implied and did not say: the audience, the
+		one thing that must feel right, what is deliberately left out>" \
+		>"$stage/SPEC.md" || die "could not write a spec"
+	[ -s "$stage/SPEC.md" ] || { rm -rf "$stage"; die "the spec came back empty"; }
+	spec_keep "$stage"
+
+	if work "$name" "$GOAL"; then
+		spec_restore "$stage"
+		mkdir -p "$ROOT/sites"
+		mv "$stage" "$dir"
+		git -C "$dir" init -q
+		git -C "$dir" add -A
+		commit "$dir" "$want"
+		record "$name" pass "$want"
+		reconcile_quiet
+		site_url "$name"
+	else
+		record "$name" fail "$want"
+		rm -rf "$stage"
+		die "$name did not pass its check, so nothing was published. The last lines above say what failed."
+	fi
+}
+
+cmd_say() {
+	[ $# -ge 2 ] || die "usage: pitch say <name> <what to change>"
+	name=$1; shift; want=$*
+	dir=$(site_dir "$name")
+	[ -d "$dir" ] || die "there is no site called $name"
+	need "${PLY:-ply}" ""; need jq ""; need git ""
+	lock "$name" || die "$name is already building a change -- that one finishes first"
+
+	stage=$ROOT/build/$name
+	rm -rf "$stage"
+	mkdir -p "$stage"
+	# Seeded from the live site without its history: commits belong to pitch,
+	# not to the model, so that git log is a record of what passed.
+	cp -R "$dir/." "$stage/"
+	rm -rf "$stage/.git"
+
+	# The request goes in its own file, alone, and **not** into SPEC.md.
+	# Appending each ask to the spec is what turned it into a changelog with a
+	# stale specification stapled to the front -- twelve entries deep, the
+	# clock's spec still described the plain dark face it started as. The
+	# record of what was asked already exists twice over: every accepted change
+	# is a commit whose message is the request, and every attempt is a line in
+	# log/<site>/. A third copy inside the brief was the problem, not the record.
+	printf '%s\n' "$want" >"$stage/.change"
+	spec_keep "$stage"
+
+	if work "$name" "$EDIT_GOAL"; then
+		spec_restore "$stage"
+		rm -f "$stage/.change"
+		# The live tree is replaced only now, at the end, by a page that has
+		# already passed. Everything except .git, because .git is the history
+		# and the history is the only thing here that cannot be rebuilt.
+		find "$dir" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+		cp -R "$stage/." "$dir/"
+		git -C "$dir" add -A
+		# A change that changes nothing is a real outcome, not an error. git
+		# refuses an empty commit and says "nothing to commit, working tree
+		# clean" -- which, arriving in a chat as the answer to "make the hands
+		# thinner", tells you nothing about the hands.
+		if git -C "$dir" diff --cached --quiet; then
+			rm -rf "$stage"
+			record "$name" nochange "$want"
+			printf 'the check passed but nothing changed -- that request made no difference\n'
+			site_url "$name"
+			unlock
+			return 0
+		fi
+		commit "$dir" "$want"
+		rm -rf "$stage"
+		record "$name" pass "$want"
+		# How much of the file moved. An edit that rewrites the whole app
+		# passes every mechanical check and is still the wrong answer, and no
+		# program here can tell the difference -- but a number can be printed,
+		# and a person reading "346 of 371 lines changed" knows immediately.
+		# This is the gauge that would have caught the clock in one message
+		# instead of five.
+		moved=$(git -C "$dir" diff --numstat HEAD~1 HEAD -- index.html 2>/dev/null |
+			awk '{print $1 + $2}')
+		# An empty numstat means the file is byte-identical, which is a real
+		# answer -- "0 of 371 lines changed" tells you the request did nothing.
+		# Printing nothing there would look like the gauge was broken.
+		total=$(wc -l <"$dir/index.html" | tr -d ' ')
+		printf '%s of %s lines changed\n' "${moved:-0}" "$total"
+		site_url "$name"
+	else
+		record "$name" fail "$want"
+		rm -rf "$stage"
+		die "that change did not pass the check, so $name is unchanged and still up."
+	fi
+}
+
+# Tweaks are cheap and each one is a commit, so nothing is ever lost while you
+# are honing. Landing is the moment that run of them becomes one thing: the
+# specification is rewritten to describe the app as it now *is*, and the tweaks
+# collapse into a single commit. The artifact does not move -- what you signed
+# off is byte for byte what ships -- so there is nothing to re-check.
+cmd_land() {
+	[ $# -eq 1 ] || die "usage: pitch land <name>"
+	name=$1
+	dir=$(site_dir "$name")
+	[ -d "$dir/.git" ] || die "there is no site called $name"
+	need "${ASK:-ask}" ""; need git ""
+	lock "$name" || die "$name is building a change -- let it finish first"
+
+	base=$(landed_base "$dir")
+	[ -n "$base" ] || die "$name has no history to land"
+	asks=$(git -C "$dir" log --reverse --format='- %s' "$base..HEAD")
+	n=$(git -C "$dir" rev-list --count "$base..HEAD")
+	[ "$n" -gt 0 ] || die "nothing to land -- $name has not changed since the last landing"
+
+	# One call, one document, and the app itself is attached: the spec must
+	# describe what is in front of it, not what the last spec claimed.
+	new=$(printf '%s\n' "$asks" | ASK_DIR=$ROOT/.ask \
+		"${ASK:-ask}" -n -q ${PITCH_SMALL_MODEL:+-m "$PITCH_SMALL_MODEL"} \
+		-a "$dir/index.html" \
+		-S "$("${ASK:-ask}" system; brief cat web-house)" \
+		"Rewrite this app's specification so it describes the app as it is now.
+		The app itself is attached. The changes asked for since the last
+		version are on stdin, and the specification you are replacing follows.
+
+		Describe what the app IS, never what changed: somebody reading it
+		should be able to tell whether a future version still does the right
+		thing. Output the markdown and nothing else, in exactly this shape:
+
+		# $name
+
+		<one sentence, for somebody who has not seen it>
+
+		## What it must do
+		- [ ] <a statement somebody could check by using the app>
+		- [ ] <five to twelve of these, behaviour only, no implementation>
+
+		## Notes
+		<what matters and why, and what is deliberately left out>
+
+		The specification being replaced:
+
+		$(cat "$dir/SPEC.md" 2>/dev/null)") || die "could not rewrite the spec"
+	[ -n "$new" ] || die "the rewritten spec came back empty"
+
+	printf '%s\n' "$new" >"$dir/SPEC.md"
+	subject=$(printf '%s\n' "$new" | sed -n '3p' | cut -c1-72)
+	[ -n "$subject" ] || subject="landed $n change(s)"
+
+	# --soft keeps the working tree exactly as it is and moves only the branch,
+	# so the artifact cannot change here even by accident. The tag is what the
+	# next run of tweaks will be measured from.
+	git -C "$dir" reset --soft "$base" -q
+	git -C "$dir" add -A
+	commit "$dir" "$subject"
+	git -C "$dir" tag -f landed HEAD >/dev/null
+	record "$name" land "$subject"
+	printf '%s tweak(s) folded into one commit, spec rewritten\n' "$n"
+	printf '%s\n' "$subject"
+	site_url "$name"
+}
+
+# Throw the whole run of tweaks away and go back to the last landed version.
+# `back` undoes one change; this undoes everything since the last landing.
+cmd_drop() {
+	[ $# -eq 1 ] || die "usage: pitch drop <name>"
+	name=$1
+	dir=$(site_dir "$name")
+	[ -d "$dir/.git" ] || die "there is no site called $name"
+	lock "$name" || die "$name is building a change -- let it finish first"
+	base=$(landed_base "$dir")
+	n=$(git -C "$dir" rev-list --count "$base..HEAD" 2>/dev/null || echo 0)
+	[ "$n" -gt 0 ] || die "nothing to drop -- $name is already at its last landed version"
+	git -C "$dir" reset --hard "$base" -q
+	record "$name" drop "$n tweaks"
+	printf '%s tweak(s) thrown away, back to %s\n' "$n" "$(git -C "$dir" log -1 --format=%s)"
+	site_url "$name"
+}
+
+cmd_back() {
+	[ $# -eq 1 ] || die "usage: pitch back <name>"
+	dir=$(site_dir "$1")
+	[ -d "$dir/.git" ] || die "there is no site called $1"
+	git -C "$dir" rev-parse --verify -q HEAD~1 >/dev/null 2>&1 ||
+		die "$1 is still its first version -- there is nothing behind it"
+	# revert makes a commit too, so it needs an identity for the same reason.
+	if git -C "$dir" config user.email >/dev/null 2>&1; then
+		git -C "$dir" revert --no-edit HEAD >/dev/null
+	else
+		git -C "$dir" -c user.name=pitch -c user.email=pitch@localhost \
+			revert --no-edit HEAD >/dev/null
+	fi
+	record "$1" back "$(git -C "$dir" log -1 --format=%s HEAD~1)"
+	printf 'back to: %s\n' "$(git -C "$dir" log -1 --format=%s HEAD~2 2>/dev/null || echo 'the first version')"
+	site_url "$1"
+}
+
+cmd_ls() {
+	if [ "${1:-}" = "-u" ]; then
+		[ $# -eq 2 ] || die "usage: pitch ls -u <name>"
+		[ -d "$(site_dir "$2")" ] || die "there is no site called $2"
+		site_url "$2"
+		return 0
+	fi
+	# An empty tree is the first run, not an error, and prints nothing.
+	[ -d "$ROOT/sites" ] || return 0
+	for d in "$ROOT/sites"/*; do
+		[ -d "$d" ] || continue
+		name=${d##*/}
+		valid_name "$name" || continue
+		if [ -f "$d/.public" ]; then vis=public; else vis=private; fi
+		when=$(git -C "$d" log -1 --format=%cr 2>/dev/null || echo 'never committed')
+		printf '%-20s %-8s %-14s %s\n' "$name" "$vis" "$when" "$(site_url "$name")"
+	done
+}
+
+cmd_open() {
+	[ $# -eq 1 ] || die "usage: pitch open <name>"
+	dir=$(site_dir "$1")
+	[ -d "$dir" ] || die "there is no site called $1"
+	: >"$dir/.public"
+	reconcile
+	printf 'anyone with the link can reach it now, and only while this machine is awake:\n'
+	site_url "$1"
+}
+
+cmd_shut() {
+	[ $# -eq 1 ] || die "usage: pitch shut <name>"
+	dir=$(site_dir "$1")
+	[ -d "$dir" ] || die "there is no site called $1"
+	rm -f "$dir/.public"
+	reconcile
+	printf 'tailnet only now:\n'
+	site_url "$1"
+}
+
+# ------------------------------------------------------------ the tailscale
+
+# Desired state, computed from the tree. One line per handler, sorted, so two
+# runs of this produce the same bytes and a diff against what tailscale
+# currently holds is the whole of the reconcile.
+desired() {
+	[ -d "$ROOT/sites" ] || return 0
+	for d in "$ROOT/sites"/*; do
+		[ -d "$d" ] || continue
+		name=${d##*/}
+		valid_name "$name" || continue
+		printf '%s /%s http://127.0.0.1:%s/%s\n' "$PITCH_HTTPS_PORT" "$name" "$PITCH_PORT" "$name"
+		[ -f "$d/.public" ] &&
+			printf '%s /%s http://127.0.0.1:%s/%s\n' "$PITCH_FUNNEL_PORT" "$name" "$PITCH_PORT" "$name"
+	done | sort
+}
+
+current() {
+	ts=$(tailscale_bin) || return 0
+	"$ts" serve status --json 2>/dev/null |
+		jq -r '(.Web // {}) | to_entries[] as $e
+			| ($e.key | split(":")[-1]) as $port
+			| ($e.value.Handlers // {}) | to_entries[]
+			| "\($port) \(.key) \(.value.Proxy // "")"' 2>/dev/null | sort
+}
+
+reconcile() {
+	ts=$(tailscale_bin) || { printf 'pitch: no tailscale, so nothing to reconcile\n' >&2; return 0; }
+	want=$(desired)
+	have=$(current)
+	[ "$want" = "$have" ] && return 0
+
+	# Remove first: a path that changed port would otherwise be served twice,
+	# and the stale handler is the one that answers.
+	printf '%s\n' "$have" | while IFS=' ' read -r port path proxy; do
+		[ -n "${port:-}" ] || continue
+		printf '%s\n' "$want" | grep -qxF "$port $path $proxy" && continue
+		"$ts" serve --https "$port" --set-path "$path" off >/dev/null
+	done
+	printf '%s\n' "$want" | while IFS=' ' read -r port path proxy; do
+		[ -n "${port:-}" ] || continue
+		printf '%s\n' "$have" | grep -qxF "$port $path $proxy" && continue
+		if [ "$port" = "$PITCH_FUNNEL_PORT" ]; then
+			"$ts" funnel --bg --yes --https "$port" --set-path "$path" "$proxy" >/dev/null
+		else
+			"$ts" serve --bg --https "$port" --set-path "$path" "$proxy" >/dev/null
+		fi
+	done
+}
+
+# A build should not fail because the tailnet is asleep. The page is proven
+# either way and the URL falls back to loopback, which is true.
+reconcile_quiet() { reconcile 2>/dev/null || true; }
+
+cmd_up() {
+	need node ""
+	pidfile=$ROOT/.serve.pid
+	# Two servers and one port. `just install` puts pitch-serve under launchd
+	# with KeepAlive, so a second one started by hand binds nothing, exits, and
+	# leaves a pid file naming a process that is already gone. Ask the port,
+	# not the pid file: the port is the thing that can only have one owner.
+	if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PITCH_PORT/" 2>/dev/null; then
+		printf 'something is already serving 127.0.0.1:%s -- launchd, or another pitch up\n' "$PITCH_PORT"
+	elif [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+		printf 'pitch-serve is already up on 127.0.0.1:%s\n' "$PITCH_PORT"
+	else
+		mkdir -p "$ROOT/log"
+		"$BIN/pitch-serve" -p "$PITCH_PORT" >>"$ROOT/log/serve.log" 2>&1 &
+		printf '%s\n' "$!" >"$pidfile"
+		# Which pitch-serve this is, so `doctor` can notice later that the
+		# file has moved on and the process has not.
+		mtime "$BIN/pitch-serve" >"$ROOT/.serve.stamp"
+		sleep 0.3
+		kill -0 "$(cat "$pidfile")" 2>/dev/null || die "pitch-serve would not start -- see log/serve.log"
+		printf 'pitch-serve on http://127.0.0.1:%s\n' "$PITCH_PORT"
+	fi
+	reconcile
+	cmd_ls
+}
+
+cmd_down() {
+	pidfile=$ROOT/.serve.pid
+	[ -f "$pidfile" ] || { printf 'nothing to stop\n'; return 0; }
+	kill "$(cat "$pidfile")" 2>/dev/null || true
+	rm -f "$pidfile" "$ROOT/.serve.stamp"
+	printf 'stopped. The tailscale config is left alone; pitch reconcile rebuilds it.\n'
+}
+
+# ---------------------------------------------------------------- the group
+
+# Telegram hands each update to one poller and then forgets it, so a message
+# sent while matterbridge is up has already been eaten. The order is: stop the
+# bridge, then send, then read -- which is the opposite of the one anyone
+# tries, and the reason this refuses rather than printing an empty answer.
+# The bridge may not be a process on this machine. `shop` runs matterbridge in
+# a container, in another pid namespace, so `pgrep -x matterbridge` on the host
+# is a guard that passes while the bridge is very much up -- and then getUpdates
+# returns an empty queue, and the advice printed is about a bot that has never
+# been spoken to. shop's own DESIGN.md records the same bug in `just ids`.
+bridge_up() {
+	pgrep -x matterbridge >/dev/null 2>&1 && { printf 'native\n'; return 0; }
+	if command -v docker >/dev/null 2>&1; then
+		[ -n "$(docker ps -q --filter name=^shop-matterbridge$ 2>/dev/null)" ] &&
+			{ printf 'container\n'; return 0; }
+	fi
+	return 1
+}
+
+cmd_group() {
+	[ $# -ge 1 ] && [ $# -le 2 ] || die "usage: pitch group <name> [chat-id]"
+	name=$1
+	# An explicit chat id skips both the bridge guard and getUpdates, because
+	# both exist only to *find* the id. Useful when you already know it -- and
+	# it is what lets the suite check this offline.
+	given=${2:-}
+	valid_name "$name" || die "\"$name\" is not a usable gateway name"
+	# `pitch` is the workshop: the group where new apps are described. It is a
+	# gateway like any other and it is the one that is not a site, so it is the
+	# one exception here -- without it there is no way to make the first group.
+	if [ "$name" != pitch ]; then
+		[ -d "$(site_dir "$name")" ] || die "there is no site called $name"
+	fi
+	need jq ""
+	conf=${MATTERBRIDGE_CONFIG:-$HOME/.config/matterbridge/matterbridge.toml}
+	[ -f "$conf" ] || die "$conf does not exist -- hail's setup comes first"
+	handlers=${HAIL_ROOT:-$HOME/projects/hail}/handlers
+	[ -d "$handlers" ] || die "$handlers does not exist -- hail's setup comes first"
+
+	grep -q "^name = \"$name\"" "$conf" && die "$name already has a gateway in $conf"
+
+	if [ -n "$given" ]; then
+		chat=$given
+	else
+	if where=$(bridge_up); then
+		case $where in
+		container) how="    shop down" ;;
+		*) how="    launchctl unload ~/Library/LaunchAgents/com.bench.matterbridge.plist" ;;
+		esac
+		die "matterbridge is running ($where), and it and getUpdates cannot both
+poll the same bot -- matterbridge wins, the queue comes back empty, and that
+reads as \"this bot has never been spoken to\".
+
+  stop it, then send a message in the group, then run this again:
+$how"
+	fi
+
+	token=$(sed -n 's/^ *Token *= *"\(.*\)".*/\1/p' "$conf" | head -1)
+	[ -n "$token" ] && [ "${#token}" -gt 20 ] || die "no telegram bot token in $conf"
+
+	chat=$(curl -fsS --max-time 20 "https://api.telegram.org/bot$token/getUpdates" |
+		jq -r --arg n "$name" '
+			[.result[].message.chat | select(.type=="group" or .type=="supergroup")]
+			| (map(select(.title==$n)) + .) | first | .id // ""')
+	[ -n "$chat" ] || die "no group message is waiting. Make the Telegram group,
+add the bot to it, send any message, and run this again -- with matterbridge
+still stopped, because it eats the queue."
+	fi
+
+	cat >>"$conf" <<EOF
+
+[[gateway]]
+name = "$name"
+enable = true
+[[gateway.inout]]
+account = "telegram.tg"
+channel = "$chat"
+[[gateway.inout]]
+account = "api.local"
+channel = "api"
+EOF
+	# A wrapper, not a symlink. `ln -s $BIN/pitch-chat` writes an absolute host
+	# path, and heed runs in a container where that path does not exist: the
+	# link dangles, the file is not executable, and heed correctly reports an
+	# unknown gateway -- which is a useless answer to "I made the group and
+	# nothing happens". $HOME/projects is the one path that means the same
+	# thing on both sides, because that is the mount shop already makes.
+	# Through a sibling temporary and a rename, and the `rm -f` is the whole
+	# point of it. `cat > handlers/<name>` **follows an existing symlink and
+	# writes to its target**: an earlier version of this made that handler a
+	# symlink to bin/pitch-chat, so re-running the command overwrote
+	# pitch-chat with the four-line wrapper -- which then exec'd itself
+	# forever. A redirect is not a create; it is an open, and open follows
+	# links. draft's own prove run reached the same rule from `sed > file`.
+	tmp=$handlers/.$name.$$
+	cat >"$tmp" <<EOF
+#!/bin/sh
+# handlers/$name -- written by pitch group. The gateway name is this file's
+# name, and heed passes it as HAIL_GATEWAY; pitch-chat reads it from there.
+exec "\${PITCH_CHAT:-\$HOME/projects/pitch/bin/pitch-chat}"
+EOF
+	chmod 755 "$tmp"
+	rm -f "$handlers/$name"
+	mv -f "$tmp" "$handlers/$name"
+	if [ "$name" = pitch ]; then
+		printf 'gateway pitch -> %s\n' "$handlers/$name"
+		printf 'start matterbridge again, then describe an app in that group.\n'
+	else
+		printf 'gateway %s -> %s -> %s\n' "$name" "$handlers/$name" "$ROOT/sites/$name"
+		printf 'start matterbridge again and that group is that app.\n'
+	fi
+}
+
+# --------------------------------------------------------------- the doctor
+
+cmd_doctor() {
+	bad=0
+	say() { printf '%-9s %s\n' "$1" "$2"; [ "$1" = "no" ] && bad=1; return 0; }
+
+	case $ROOT in
+	"$HOME"/*) say ok "the tree is under \$HOME, so a container can see it" ;;
+	*) say no "$ROOT is outside \$HOME. A bind mount there is silently empty
+          inside the VM -- the container starts, /work is not your tree, and
+          nothing anywhere says why." ;;
+	esac
+
+	for p in node git jq; do
+		command -v "$p" >/dev/null 2>&1 && say ok "$p" || say no "$p is not on PATH"
+	done
+	for p in ask ply brief; do
+		command -v "$p" >/dev/null 2>&1 && say ok "$p" || say no "$p is not on PATH -- the bench is not installed"
+	done
+
+	if c=$(command -v chromium || command -v chromium-browser || true); [ -n "$c" ]; then
+		say ok "chromium at $c"
+	elif [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+		say ok "Google Chrome"
+	else
+		say no "no chrome or chromium -- page-check cannot open anything. Set \$CHROME"
+	fi
+
+	if ts=$(tailscale_bin); then
+		host=$(tailnet_host || true)
+		if [ -n "$host" ]; then say ok "tailnet as $host"
+		else say no "tailscale is installed but logged out -- run: $ts up"; fi
+	else
+		say no "no tailscale, so every URL is loopback only"
+	fi
+
+	# Ask the port, not the pid file. `just install` runs pitch-serve under
+	# launchd, which writes no pid file of ours, so a doctor consulting
+	# .serve.pid reports "not running" about a server that is plainly serving
+	# -- and that is the *ordinary* install, which makes it the worst possible
+	# false alarm. cmd_up already reasons this way: the port is the thing that
+	# can only have one owner.
+	if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:$PITCH_PORT/" 2>/dev/null; then
+		# A server that is up and quietly running last week's rules looks
+		# exactly like a working one. It cost a live check here: SPEC.md was
+		# 404 through pitch-serve and 200 through tailscale, and the difference
+		# was a process started before the rule was written.
+		was=$(cat "$ROOT/.serve.stamp" 2>/dev/null || true)
+		is=$(mtime "$BIN/pitch-serve")
+		if [ -z "$was" ]; then
+			say ok "pitch-serve up on 127.0.0.1:$PITCH_PORT (launchd, or another shell)"
+		elif [ "$was" = "$is" ]; then
+			say ok "pitch-serve up on 127.0.0.1:$PITCH_PORT"
+		else
+			say no "pitch-serve is running code older than bin/pitch-serve -- pitch down && pitch up"
+		fi
+	else
+		say no "nothing is serving 127.0.0.1:$PITCH_PORT -- pitch up, or: just install"
+	fi
+
+	gone=
+	while read -r t; do
+		t=${t%%#*}; t=$(printf '%s' "$t" | tr -d ' \t')
+		[ -n "$t" ] || continue
+		[ "$t" = page-check ] && continue
+		command -v "$t" >/dev/null 2>&1 || gone="$gone $t"
+	done <"$SELF/etc/toolbox"
+	[ -z "$gone" ] && say ok "every program in etc/toolbox is on PATH" ||
+		say no "the toolbox would be incomplete:$gone"
+
+	[ "$bad" = 0 ] || exit 1
+}
+
+# ------------------------------------------------------------------- dispatch
+
+[ $# -gt 0 ] || usage
+verb=$1; shift
+case $verb in
+new) cmd_new "$@" ;;
+say | edit) cmd_say "$@" ;;
+slug) cmd_slug "$@" ;;
+ls) cmd_ls "$@" ;;
+back) cmd_back "$@" ;;
+land) cmd_land "$@" ;;
+drop) cmd_drop "$@" ;;
+open) cmd_open "$@" ;;
+shut) cmd_shut "$@" ;;
+up) cmd_up "$@" ;;
+down) cmd_down "$@" ;;
+reconcile) reconcile ;;
+desired) desired ;;
+group) cmd_group "$@" ;;
+doctor) cmd_doctor "$@" ;;
+-h | --help | help) usage ;;
+*) die "no such command: $verb (try: pitch help)" ;;
+esac

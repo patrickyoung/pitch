@@ -1,0 +1,10 @@
+#!/bin/sh
+# bin/check -- the definition of done. `draft check` reads this name out of
+# DESIGN.md and `ply -check` runs exactly this command.
+#
+# It is offline: no tailnet, no chat network, no model provider, no
+# credentials. The one thing it does need is a browser, because page-check's
+# entire job is to open a page in one -- and a suite that stubbed the browser
+# would be checking the stub.
+set -eu
+exec sh "$(dirname -- "$0")/../tests/suite" "$@"

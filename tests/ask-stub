@@ -1,0 +1,32 @@
+#!/bin/sh
+# tests/ask-stub -- stands in for ask. The suite reaches no model provider.
+#
+# `ask system` prints something; a slug question gets a slug; anything else
+# gets a spec-shaped document. Nothing here is clever: the point is that every
+# case around the model runs with no network and no credentials.
+set -eu
+
+[ "${1:-}" = "system" ] && { printf 'you are a stub\n'; exit 0; }
+
+want=$(cat 2>/dev/null || true)
+printf '%s\n' "ask $*" >>"${STUB_LOG:-/dev/null}"
+
+case " $* " in
+*"a name for the app"*)
+	printf '%s\n' "${STUB_SLUG:-counter}"
+	;;
+*)
+	cat <<EOF
+# ${STUB_SLUG:-counter}
+
+A stub spec, written without a model.
+
+## What it must do
+- [ ] it counts
+- [ ] it starts at zero
+
+## Notes
+Asked for: $want
+EOF
+	;;
+esac

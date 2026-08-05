@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.bench.pitch - the static server, kept alive.
+
+  Only the server. The tailscale configuration is not a daemon: tailscaled
+  holds it across reboots, and pitch reconciles it when the tree changes,
+  which is the only time it can change. A second job polling for drift would
+  be a supervisor of a thing that has no state to drift.
+
+  launchd inherits almost nothing, so PATH is written out. `node` is what
+  pitch-serve's shebang looks for and homebrew is not on the default path;
+  hail carries the same comment for the same reason, and hn's classify once
+  died with `ask: not found` on the one path nobody runs by hand.
+
+  Written by `just install`, which substitutes @ROOT@ and @HOME@.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bench.pitch</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@ROOT@/bin/pitch-serve</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@ROOT@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:@HOME@/go/bin:@HOME@/.local/bin</string>
+    <key>PITCH_ROOT</key>
+    <string>@ROOT@</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>@ROOT@/log/serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>@ROOT@/log/serve.log</string>
+</dict>
+</plist>

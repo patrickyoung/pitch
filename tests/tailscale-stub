@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+# tests/tailscale-stub -- stands in for the tailscale CLI, and keeps state.
+#
+# Reconcile is only interesting if it can be run twice, so a stub that merely
+# records argv cannot answer the question the case exists to ask: does the
+# second run issue any command at all? This one applies what it is told and
+# renders it back through `serve status --json`, so the second run reads its
+# own first run and finds nothing to do.
+#
+# Every invocation is appended to $STUB_LOG. The state is $STUB_STATE.
+import json, os, sys
+
+log = os.environ.get('STUB_LOG', '/dev/null')
+state_path = os.environ['STUB_STATE']
+
+with open(log, 'a') as f:
+    f.write(' '.join(sys.argv[1:]) + '\n')
+
+try:
+    with open(state_path) as f:
+        state = json.load(f)
+except (OSError, ValueError):
+    state = {'Web': {}, 'AllowFunnel': {}}
+
+argv = sys.argv[1:]
+if not argv:
+    sys.exit(2)
+
+def flag(name, default=None):
+    return argv[argv.index(name) + 1] if name in argv else default
+
+verb = argv[0]
+
+if verb == 'status':
+    print(json.dumps({'Self': {'DNSName': os.environ.get('STUB_DNSNAME', 'mac.tail1234.ts.net.')}}))
+    sys.exit(0)
+
+if verb in ('serve', 'funnel') and len(argv) > 1 and argv[1] == 'status':
+    print(json.dumps(state))
+    sys.exit(0)
+
+if verb in ('serve', 'funnel'):
+    port = flag('--https', '443')
+    path = flag('--set-path', '/')
+    target = argv[-1]
+    key = f'mac.tail1234.ts.net:{port}'
+    web = state['Web'].setdefault(key, {'Handlers': {}})
+    if target == 'off':
+        web['Handlers'].pop(path, None)
+        if not web['Handlers']:
+            state['Web'].pop(key, None)
+            state['AllowFunnel'].pop(key, None)
+    else:
+        web['Handlers'][path] = {'Proxy': target}
+        if verb == 'funnel':
+            state['AllowFunnel'][key] = True
+    with open(state_path, 'w') as f:
+        json.dump(state, f)
+    sys.exit(0)
+
+sys.exit(2)

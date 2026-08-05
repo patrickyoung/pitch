@@ -1,0 +1,34 @@
+# The toolbox, one program per line. `just link` builds tools/ from this file
+# and case 18 of the suite fails if the directory and this list disagree.
+#
+# `ply -t tools` makes PATH this directory alone, so the model reaches these
+# and cannot name one that is not here. It **aims** the model; it does not
+# sandbox it -- sh has builtins and a redirect opens a file with no program
+# involved. The boundary is the container, which is why the builder runs in
+# one. Saying otherwise would be the lie ply's SECURITY.md exists to prevent.
+
+# read
+ls
+cat
+head
+tail
+grep
+find
+diff
+wc
+
+# write
+sed
+awk
+mkdir
+mv
+cp
+rm
+touch
+
+# the check, and the runtime it needs. page-check's shebang is
+# `/usr/bin/env node`, and with PATH set to this directory alone that lookup
+# happens *here* -- so a toolbox without node is a checker the model cannot
+# run itself, and it would then be blind between cycles.
+node
+page-check

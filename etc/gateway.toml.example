@@ -1,0 +1,29 @@
+# What `pitch group <name>` appends to ~/.config/matterbridge/matterbridge.toml.
+#
+# One gateway per site, and the gateway name is the site name is the handler
+# name is the URL path. Nothing else has to know that: heed runs
+# handlers/<name>, which is a symlink to bin/pitch-chat, which reads its own
+# argv[0] to learn which app it is.
+#
+# The workshop is a gateway too, called "pitch". It is where new apps are
+# described, and it is the only one that makes things.
+
+[[gateway]]
+name = "pitch"                       # -> handlers/pitch -> bin/pitch-chat
+enable = true
+[[gateway.inout]]
+account = "telegram.tg"
+channel = "-1004444444444"           # the Telegram group id, with the minus
+[[gateway.inout]]
+account = "api.local"
+channel = "api"                      # matterbridge fixes this name; leave it
+
+[[gateway]]
+name = "pomodoro"                    # -> handlers/pomodoro -> bin/pitch-chat
+enable = true
+[[gateway.inout]]
+account = "telegram.tg"
+channel = "-1005555555555"
+[[gateway.inout]]
+account = "api.local"
+channel = "api"

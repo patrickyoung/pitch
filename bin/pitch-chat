@@ -1,0 +1,187 @@
+#!/bin/sh
+# pitch-chat -- one program, and every site's chat group points at it.
+#
+#     pitch group pomodoro     # writes handlers/pomodoro, which runs this
+#
+# heed runs handlers/<gateway> and passes the gateway name in the environment,
+# so the site name is the gateway name is the handler name is the URL path, and
+# adding a site never edits this file or heed. Run as `pitch` it is the
+# workshop, where new apps are described; run as anything else it is that app's
+# group.
+#
+# A build takes minutes and heed kills a handler at HEED_TIMEOUT, so anything
+# slow answers twice -- once now, once when it is real -- exactly as
+# handlers/edm does, and for the same two reasons written down there.
+set -eu
+
+prog=$0
+while [ -L "$prog" ]; do
+	dir=$(dirname -- "$prog")
+	link=$(readlink -- "$prog")
+	case $link in
+	/*) prog=$link ;;
+	*) prog=$dir/$link ;;
+	esac
+done
+BIN=$(CDPATH= cd -- "$(dirname -- "$prog")" && pwd)
+. "$BIN/../lib/common.sh"
+# SELF is where this program's own files are; ROOT is where the sites are.
+# The same two questions bin/pitch answers, and the same reason they are two.
+SELF=$(CDPATH= cd -- "$BIN/.." && pwd)
+ROOT=${PITCH_ROOT:-$SELF}
+load_config
+
+# The gateway name is the handler's name, and heed hands it over as
+# HAIL_GATEWAY. That is preferred over argv[0] for one reason: a handler cannot
+# always *be* this program. `handlers/<site>` was a symlink until it met the
+# container -- an absolute path to /Users/patrick/... does not exist under
+# /opt/hail, so heed saw a dangling link, reported an unknown gateway, and the
+# first message in a new group did nothing. A wrapper script crosses both
+# filesystems and loses argv[0], so the name arrives in the environment instead.
+# argv[0] remains the fallback, which is what makes this testable without heed.
+SITE=${HAIL_GATEWAY:-${0##*/}}
+[ "$SITE" = "pitch-chat" ] &&
+	die "this needs a site: run it as handlers/<site>, or set HAIL_GATEWAY.
+    pitch group <site> writes the handler for you."
+valid_name "$SITE" || die "\"$SITE\" is not a site name"
+
+# Both catalogues, left to right, exactly like $PATH. web-house lives here and
+# hail-house lives in hail, and a reply needs both: what a good page is, and
+# how to write for somebody reading it one-handed while walking. Setting this
+# to one directory silently drops the other, and the symptom is a chat reply
+# with markdown tables in it.
+BRIEF_PATH=$SELF/skills:${HAIL_ROOT:-$HOME/projects/hail}/skills
+export BRIEF_PATH
+ASK_DIR=${ASK_DIR:-$ROOT/.ask}
+export ASK_DIR
+
+msg=$(cat)
+[ -n "$msg" ] || exit 0
+
+# The message is data. It reaches ask and ply on stdin or as one argument that
+# nothing re-parses, and it never becomes a shell word -- hail's design has
+# the same rule and this is the handler it was written for.
+say() { printf '%s\n' "$*"; }
+
+# ------------------------------------------------------------- the workshop
+
+if [ "$SITE" = "pitch" ]; then
+	say "on it. Naming it and building it now -- a few minutes."
+	(
+		if ! name=$(pitch slug "$msg" 2>&1); then
+			printf 'could not name that one:\n%s\n' "$name" | hail pitch
+			exit 0
+		fi
+		if url=$(pitch new "$name" "$msg" 2>&1 | tail -1); then
+			printf '%s\n\nits group is "%s". Make that Telegram group, add the bot, send anything in it, then run:\npitch group %s\n' \
+				"$url" "$name" "$name" | hail pitch
+		else
+			printf '%s did not pass its check, so nothing was published:\n%s\n' \
+				"$name" "$(printf '%s' "$url" | tail -3)" | hail pitch
+		fi
+	) </dev/null >/dev/null 2>&1 &
+	exit 0
+fi
+
+# ---------------------------------------------------------------- one app
+
+dir=$ROOT/sites/$SITE
+[ -d "$dir" ] || { say "there is no site called $SITE yet."; exit 0; }
+
+# One cheap call, and it saves a whole ply loop on "what colour is the button".
+# A model deciding what a sentence wants is judgment; a model deciding whether
+# it is allowed to would be an authorization bug with extra steps, and it is
+# not asked that -- every verb below is one this group already owns.
+verb=$(printf '%s' "$msg" | ask -n -q ${HAIL_MODEL:+-m "$HAIL_MODEL"} \
+	'The message on stdin is about a web app somebody owns. Answer with one
+	word and nothing else:
+
+	change   they want the app to be different
+	ask      they are asking a question about it
+	open     they want it reachable from the internet
+	shut     they want it private again
+	back     they want the last change undone
+	land     they are satisfied and want this run of tweaks settled
+	drop     they want to abandon everything since the last settled version
+	url      they want the link' 2>/dev/null || echo ask)
+
+case $verb in
+open) say "$(pitch open "$SITE" 2>&1)" ;;
+shut) say "$(pitch shut "$SITE" 2>&1)" ;;
+url) say "$(pitch ls -u "$SITE" 2>&1)" ;;
+back) say "$(pitch back "$SITE" 2>&1 || true)" ;;
+land) say "$(pitch land "$SITE" 2>&1 || true)" ;;
+drop) say "$(pitch drop "$SITE" 2>&1 || true)" ;;
+change)
+	say "on it. Building and checking that -- a few minutes."
+	(
+		if out=$(pitch say "$SITE" "$msg" 2>&1); then
+			# Two lines: how much of the file moved, and the URL. The first is
+			# the gauge -- "346 of 371 lines changed" is a rewrite wearing the
+			# app's name, and saying so is the only warning available.
+			printf '%s\n' "$(printf '%s' "$out" | tail -2)" | hail "$SITE"
+		else
+			printf 'that did not pass the check, so %s is unchanged and still up:\n%s\n' \
+				"$SITE" "$(printf '%s' "$out" | tail -3)" | hail "$SITE"
+		fi
+	) </dev/null >/dev/null 2>&1 &
+	;;
+*)
+	# Expert in this app and its domain, out of things that already exist: the
+	# house style for a phone, the doctrine the app was built to, the spec, and
+	# whichever skill on BRIEF_PATH fits what this app is about.
+	#
+	# The domain skill is chosen once and written down, not chosen per message.
+	# `brief find -ask` is a model call, and paying for one on every turn to
+	# answer a question whose answer cannot change is the kind of cost that
+	# hides. It is a file, so it can also be corrected by hand.
+	if [ ! -f "$dir/.domain" ]; then
+		brief find -q -ask "$(head -3 "$dir/SPEC.md" 2>/dev/null)" >"$dir/.domain" 2>/dev/null || : >"$dir/.domain"
+	fi
+	domain=$(cat "$dir/.domain" 2>/dev/null || true)
+	set -- -q -f "$HAIL_THREAD" \
+		-S "$(ask system; brief cat hail-house web-house ${domain:+"$domain"} 2>/dev/null; cat "$dir/SPEC.md" 2>/dev/null)"
+	[ -n "${HAIL_MODEL:-}" ] && set -- "$@" -m "$HAIL_MODEL"
+
+	# The source is attached when the conversation starts *and* whenever it has
+	# changed since it was last attached. "Once, at the start" was handlers/hn's
+	# rule and it is wrong here, because this app is edited between turns: three
+	# changes in, the agent was answering questions about a version it had never
+	# seen. The stamp lives beside the thread, because it is a fact about this
+	# conversation and not about the app.
+	seen=${HAIL_THREAD%.jsonl}.attached
+	is=$(mtime "$dir/index.html" 2>/dev/null || echo 0)
+	if [ ! -s "${HAIL_THREAD:-/dev/null}" ] || [ "$(cat "$seen" 2>/dev/null || true)" != "$is" ]; then
+		set -- "$@" -a "$dir/index.html"
+		printf '%s' "$is" >"$seen"
+	fi
+
+	# ask exits 2 on a full window, permanently: retrying the same call is the
+	# failure that arrives with a bill. There is no percentage to read, so the
+	# proxy is the size of the session on disk -- compact before asking when it
+	# is over budget, and again if ask says so anyway. A compacted thread has
+	# lost the attachment, so the stamp goes with it.
+	compact() {
+		fresh=$(ask compact -q "$HAIL_THREAD" 2>/dev/null) || return 1
+		[ -s "$fresh" ] || return 1
+		mv -f "$fresh" "$HAIL_THREAD"
+		rm -f "$seen"
+		return 0
+	}
+	if [ -f "$HAIL_THREAD" ] &&
+		[ "$(wc -c <"$HAIL_THREAD" | tr -d ' ')" -gt "${PITCH_THREAD_MAX:-500000}" ]; then
+		compact || true
+	fi
+
+	set +e
+	out=$(printf '%s' "$msg" | ask "$@" 2>&1)
+	st=$?
+	if [ "$st" = 2 ] && compact; then
+		out=$(printf '%s' "$msg" | ask "$@" 2>&1)
+		st=$?
+	fi
+	set -e
+	[ "$st" = 0 ] || out="that did not go through: $(printf '%s' "$out" | tail -2)"
+	say "$out"
+	;;
+esac

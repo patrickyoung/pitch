@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Charts</title>
+<script type="importmap">
+{ "imports": { "chart": "https://esm.sh/chart.js@latest" } }
+</script>
+<script src="http://cdn.example.invalid/legacy.js"></script>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; color: #111; background: #fff; margin: 0; padding: 2rem; }
+</style>
+<body>
+  <main><h1>Charts</h1><button id="b">Draw</button></main>
+<script type="module">
+  document.getElementById('b').addEventListener('click', e => { e.target.textContent = 'Drawn'; });
+</script>

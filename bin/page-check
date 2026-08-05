@@ -1,0 +1,538 @@
+#!/usr/bin/env node
+// page-check -- open a page in a browser and decide whether it is done.
+//
+// This is the check. `ply` drives until it exits 0, so everything it asserts
+// is mechanical and nothing here asks a model anything: a model must never
+// grade its own homework.
+//
+// It has no dependencies and no build step, which is the rule it exists to
+// enforce. Chrome is driven over the DevTools protocol through node's own
+// WebSocket, so there is no package.json here and there never will be.
+//
+//   page-check http://127.0.0.1:8787/clock/
+//
+// exit 0 the page is done . 1 it is not, and every reason is printed
+//      2 the check could not run, which is not the same answer
+
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
+const DEFAULTS = {
+	timeout: 30,        // seconds for the whole run
+	budget: 512000,     // bytes of same-origin payload. A page over this has a
+	                    // bundle hiding in it; it is not a style rule
+	narrow: 390,        // the phone. No horizontal scroll here, ever
+	wide: 1440,
+	settle: 600,        // ms of no in-flight requests that counts as loaded
+	alive: 1200,        // ms to watch a page that has no controls to click
+	clicks: 3,          // controls to try before calling a page inert
+};
+
+// ---------------------------------------------------------------- arguments
+
+const argv = process.argv.slice(2);
+const opt = { ...DEFAULTS, shot: null, axe: false, json: false, url: null };
+const fail2 = m => { process.stderr.write(`page-check: ${m}\n`); process.exit(2); };
+
+for (let i = 0; i < argv.length; i++) {
+	const a = argv[i];
+	const num = name => {
+		const v = Number(argv[++i]);
+		if (!Number.isFinite(v) || v <= 0) fail2(`${name} wants a positive number`);
+		return v;
+	};
+	if (a === '-timeout') opt.timeout = num('-timeout');
+	else if (a === '-budget') opt.budget = num('-budget');
+	else if (a === '-shot') opt.shot = argv[++i] ?? fail2('-shot wants a file');
+	else if (a === '-json') opt.json = true;
+	else if (a === '-h' || a === '--help') {
+		process.stdout.write(
+			'usage: page-check [-timeout s] [-budget bytes] [-shot file] [-json] <url>\n');
+		process.exit(0);
+	} else if (a.startsWith('-')) fail2(`unknown flag ${a}`);
+	else if (opt.url) fail2('one url at a time');
+	else opt.url = a;
+}
+if (!opt.url) fail2('usage: page-check [flags] <url>');
+
+let origin;
+try { origin = new URL(opt.url).origin; } catch { fail2(`not a url: ${opt.url}`); }
+
+// ------------------------------------------------------------------ chrome
+
+// Named in the order a machine is likely to have them. $CHROME wins, because
+// the container's chromium is not at any of these paths.
+const CHROMES = [
+	process.env.CHROME,
+	'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+	'/Applications/Chromium.app/Contents/MacOS/Chromium',
+	'/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome',
+	'/usr/bin/google-chrome-stable',
+].filter(Boolean);
+
+const chrome = CHROMES.find(p => existsSync(p));
+if (!chrome) fail2(
+	'no chrome or chromium found. Set $CHROME to the binary, or install one:\n' +
+	CHROMES.slice(1).map(p => `  looked at ${p}`).join('\n'));
+
+const profile = mkdtempSync(path.join(tmpdir(), 'page-check-'));
+let child = null;
+const cleanup = () => {
+	if (child && child.exitCode === null) { try { child.kill('SIGKILL'); } catch {} }
+	try { rmSync(profile, { recursive: true, force: true }); } catch {}
+};
+process.on('exit', cleanup);
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { cleanup(); process.exit(2); });
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function launch() {
+	const args = [
+		'--headless=new', '--disable-gpu', '--mute-audio',
+		'--remote-debugging-port=0', `--user-data-dir=${profile}`,
+		'--no-first-run', '--no-default-browser-check', '--disable-extensions',
+		'--disable-background-networking', '--disable-sync', '--disable-translate',
+		'--window-size=1440,900', 'about:blank',
+	];
+	// A container has no user namespaces to build a sandbox out of, and it is
+	// itself the sandbox -- that is the whole reason the builder runs in one.
+	// Do not copy this line onto a laptop.
+	if (process.getuid?.() === 0 || existsSync('/.dockerenv')) args.unshift('--no-sandbox');
+
+	child = spawn(chrome, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+	let stderr = '';
+	child.stderr.on('data', d => { stderr += d; if (stderr.length > 8192) stderr = stderr.slice(-8192); });
+	child.on('error', e => fail2(`could not start ${chrome}: ${e.message}`));
+
+	// Port 0 means chrome picks one and writes it here. Asking for a fixed port
+	// races every other page-check on the machine, and two builds is the point.
+	const portFile = path.join(profile, 'DevToolsActivePort');
+	for (let i = 0; i < 200; i++) {
+		if (existsSync(portFile)) {
+			const first = readFileSync(portFile, 'utf8').split('\n')[0].trim();
+			if (first) return Number(first);
+		}
+		if (child.exitCode !== null) fail2(`chrome exited ${child.exitCode}\n${stderr.trim()}`);
+		await sleep(50);
+	}
+	fail2(`chrome never reported a debugging port\n${stderr.trim()}`);
+}
+
+// --------------------------------------------------------------------- cdp
+
+class CDP {
+	constructor(ws) {
+		this.ws = ws; this.id = 0; this.pending = new Map(); this.handlers = new Map();
+		ws.addEventListener('message', ev => {
+			const msg = JSON.parse(ev.data);
+			if (msg.id !== undefined) {
+				const p = this.pending.get(msg.id);
+				if (!p) return;
+				this.pending.delete(msg.id);
+				msg.error ? p.reject(new Error(`${msg.error.message} (${p.method})`)) : p.resolve(msg.result);
+				return;
+			}
+			for (const fn of this.handlers.get(msg.method) ?? []) fn(msg.params, msg.sessionId);
+		});
+		ws.addEventListener('close', () => {
+			for (const p of this.pending.values()) p.reject(new Error('devtools connection closed'));
+			this.pending.clear();
+		});
+	}
+	static async open(url) {
+		const ws = new WebSocket(url);
+		await new Promise((res, rej) => {
+			ws.addEventListener('open', res, { once: true });
+			ws.addEventListener('error', () => rej(new Error(`cannot reach ${url}`)), { once: true });
+		});
+		return new CDP(ws);
+	}
+	on(event, fn) {
+		if (!this.handlers.has(event)) this.handlers.set(event, []);
+		this.handlers.get(event).push(fn);
+	}
+	send(method, params = {}, sessionId) {
+		const id = ++this.id;
+		this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+		return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject, method }));
+	}
+}
+
+// ------------------------------------------------------------- the in-page
+// One function, sent as source and run in the page. It is a string on this
+// side so there is nothing to bundle, which is the point of the exercise.
+
+const AUDIT = `(() => {
+	const out = { problems: [], controls: 0, digest: 0, animations: 0 };
+	const say = (kind, detail) => out.problems.push({ kind, detail });
+	const text = el => (el.textContent || '').replace(/\\s+/g, ' ').trim();
+	const cut = (s, n = 90) => s.length > n ? s.slice(0, n) + '...' : s;
+	const where = el => {
+		const id = el.id ? '#' + el.id : '';
+		const cls = typeof el.className === 'string' && el.className
+			? '.' + el.className.trim().split(/\\s+/)[0] : '';
+		return el.tagName.toLowerCase() + id + cls;
+	};
+
+	// ---- structure
+	if (!document.documentElement.getAttribute('lang')) say('a11y', '<html> has no lang attribute');
+	if (!document.title.trim()) say('a11y', 'the page has no <title>');
+	if (!document.querySelector('meta[name=viewport]')) say('a11y', 'no viewport meta -- the phone will render it at desktop width');
+
+	// ---- resources that were written wrong rather than fetched wrong
+	for (const el of document.querySelectorAll('script[src], link[href], img[src], iframe[src]')) {
+		const raw = el.getAttribute('src') || el.getAttribute('href') || '';
+		if (/^http:\\/\\//i.test(raw)) say('mixed', where(el) + ' loads over http: ' + cut(raw));
+		if (/@latest\\b/.test(raw)) say('pin', where(el) + ' is unpinned: ' + cut(raw));
+	}
+	for (const el of document.querySelectorAll('script[type="importmap"]')) {
+		if (/@latest\\b/.test(el.textContent || '')) say('pin', 'the import map has an @latest specifier in it');
+		if (/^\\s*$/.test(el.textContent || '')) say('pin', 'the import map is empty');
+	}
+
+	// ---- accessibility, conservatively: only things that are always wrong
+	for (const img of document.querySelectorAll('img:not([alt])')) {
+		if (img.getAttribute('role') === 'presentation' || img.getAttribute('aria-hidden') === 'true') continue;
+		say('a11y', 'img with no alt attribute: ' + cut(img.getAttribute('src') || where(img)));
+	}
+	const named = el => !!(text(el) || el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')
+		|| el.getAttribute('title') || el.querySelector('img[alt]:not([alt=""])')
+		|| (el.value && (el.type === 'submit' || el.type === 'button' || el.type === 'reset')));
+	for (const el of document.querySelectorAll('button, [role=button], a[href], input[type=submit], input[type=button]')) {
+		if (el.offsetParent === null && el.tagName !== 'A') continue;
+		if (!named(el)) say('a11y', 'no accessible name on ' + where(el) + ' -- a screen reader announces nothing');
+	}
+	for (const el of document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]), textarea, select')) {
+		if (el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') || el.getAttribute('title')) continue;
+		if (el.id && document.querySelector('label[for="' + CSS.escape(el.id) + '"]')) continue;
+		if (el.closest('label')) continue;
+		say('a11y', 'no label for ' + where(el));
+	}
+	for (const el of document.querySelectorAll('[tabindex]')) {
+		if (Number(el.getAttribute('tabindex')) > 0)
+			say('a11y', where(el) + ' has a positive tabindex, which reorders the whole page');
+	}
+
+	// ---- contrast. Resolved through a canvas pixel so any colour syntax the
+	// browser understands -- oklch, color-mix, light-dark -- lands as sRGB.
+	const px = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+	const rgba = str => {
+		px.clearRect(0, 0, 1, 1); px.fillStyle = '#000'; px.fillStyle = str;
+		px.fillRect(0, 0, 1, 1);
+		const d = px.getImageData(0, 0, 1, 1).data;
+		return [d[0], d[1], d[2], d[3] / 255];
+	};
+	const lum = ([r, g, b]) => {
+		const f = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+		return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+	};
+	const backdrop = el => {
+		for (let n = el; n && n !== document.documentElement.parentNode; n = n.parentElement) {
+			const cs = getComputedStyle(n);
+			if (cs.backgroundImage !== 'none') return null;   // cannot know; do not guess
+			const c = rgba(cs.backgroundColor);
+			if (c[3] > 0.95) return c;
+		}
+		return [255, 255, 255, 1];
+	};
+	const seen = new Set();
+	let worst = null;
+	for (const el of document.querySelectorAll('body *')) {
+		const own = [...el.childNodes].filter(n => n.nodeType === 3 && n.textContent.trim().length > 2);
+		if (!own.length || el.offsetParent === null) continue;
+		const cs = getComputedStyle(el);
+		if (cs.visibility === 'hidden' || Number(cs.opacity) < 0.5) continue;
+		const bg = backdrop(el);
+		if (!bg) continue;
+		const fg = rgba(cs.color);
+		if (fg[3] < 0.95) continue;
+		const a = lum(fg), b = lum(bg);
+		const ratio = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+		const size = parseFloat(cs.fontSize), bold = Number(cs.fontWeight) >= 700;
+		const need = (size >= 24 || (size >= 18.66 && bold)) ? 3 : 4.5;
+		if (ratio + 0.01 < need) {
+			const key = where(el) + need;
+			if (!worst || ratio < worst.ratio) worst = { ratio, need, el: where(el), sample: cut(text(el), 40) };
+			if (seen.has(key)) continue;
+			seen.add(key);
+			say('contrast', where(el) + ' text is ' + ratio.toFixed(2) + ':1 against its background, needs '
+				+ need + ':1 -- "' + cut(text(el), 40) + '"');
+		}
+	}
+
+	// ---- is there anything here that reacts
+	const CLICKABLE = 'button:not([disabled]), summary, [role=button], select,'
+		+ ' input[type=button], input[type=submit], input[type=reset],'
+		+ ' input[type=checkbox], input[type=radio], a[href^="#"]';
+	out.controls = [...document.querySelectorAll(CLICKABLE)].filter(el => el.offsetParent !== null).length;
+	out.animations = document.getAnimations ? document.getAnimations().length : 0;
+
+	let h = 5381;
+	const s = document.body ? document.body.innerHTML : '';
+	for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+	out.digest = h;
+	return out;
+})()`;
+
+const DIGEST = `(() => {
+	let h = 5381; const s = document.body ? document.body.innerHTML : '';
+	for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+	return { digest: h, href: location.href };
+})()`;
+
+const CLICK = n => `(() => {
+	const CLICKABLE = 'button:not([disabled]), summary, [role=button], select,'
+		+ ' input[type=button], input[type=submit], input[type=reset],'
+		+ ' input[type=checkbox], input[type=radio], a[href^="#"]';
+	const els = [...document.querySelectorAll(CLICKABLE)].filter(el => el.offsetParent !== null);
+	const el = els[${n}];
+	if (!el) return null;
+	el.scrollIntoView({ block: 'center', behavior: 'instant' });
+	const r = el.getBoundingClientRect();
+	const name = (el.textContent || el.value || el.tagName).replace(/\\s+/g, ' ').trim().slice(0, 40);
+	return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height, name };
+})()`;
+
+// -------------------------------------------------------------------- main
+
+const problems = [];
+const bad = (kind, detail) => problems.push({ kind, detail });
+
+async function main() {
+	const port = await launch();
+	const version = await fetch(`http://127.0.0.1:${port}/json/version`).then(r => r.json());
+	const browser = await CDP.open(version.webSocketDebuggerUrl);
+
+	const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank' });
+	const { sessionId } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
+	const send = (m, p) => browser.send(m, p, sessionId);
+
+	// Everything below is collected while the page loads, so enable first.
+	await send('Page.enable');
+	await send('Runtime.enable');
+	await send('Network.enable');
+	await send('Log.enable');
+
+	// A modal dialog blocks the protocol outright: the page stops answering and
+	// so does the check. Accept and record instead of hanging.
+	browser.on('Page.javascriptDialogOpening', (p, s) => {
+		if (s !== sessionId) return;
+		bad('dialog', `the page opened a ${p.type}(): ${String(p.message).slice(0, 120)}`);
+		send('Page.handleJavaScriptDialog', { accept: true }).catch(() => {});
+	});
+
+	let inflight = 0, lastQuiet = Date.now(), bytes = 0, requests = 0;
+	const only = fn => (p, s) => { if (s === sessionId) fn(p); };
+	// The browser asks for this on its own initiative. Blaming the page for a
+	// request the page never wrote is how a check earns the reputation of
+	// crying wolf, which is the only way a real failure gets ignored.
+	const unasked = url => url === `${origin}/favicon.ico`;
+
+	browser.on('Network.requestWillBeSent', only(() => { inflight++; requests++; }));
+	browser.on('Network.loadingFinished', only(p => {
+		inflight = Math.max(0, inflight - 1); lastQuiet = Date.now();
+		bytes += p.encodedDataLength || 0;
+	}));
+	browser.on('Network.responseReceived', only(p => {
+		if (p.response.status >= 400 && !unasked(p.response.url))
+			bad('request', `${p.response.status} for ${p.response.url.slice(0, 120)}`);
+	}));
+	browser.on('Network.loadingFailed', only(p => {
+		inflight = Math.max(0, inflight - 1); lastQuiet = Date.now();
+		if (p.canceled) return;
+		bad('request', `${p.errorText}${p.blockedReason ? ` (${p.blockedReason})` : ''} loading a ${p.type}`);
+	}));
+	browser.on('Network.requestWillBeSent', only(p => {
+		if (unasked(p.request.url)) requests--;   // counted, then uncounted: it is not the page's
+	}));
+	browser.on('Runtime.consoleAPICalled', only(p => {
+		if (p.type !== 'error' && p.type !== 'assert') return;
+		const msg = p.args.map(a => a.value ?? a.description ?? a.unserializableValue ?? a.type).join(' ');
+		bad('console', `console.${p.type}: ${String(msg).slice(0, 200)}`);
+	}));
+	browser.on('Runtime.exceptionThrown', only(p => {
+		const d = p.exceptionDetails;
+		const what = d.exception?.description ?? d.text ?? 'exception';
+		const at = d.url ? ` (${d.url.split('/').pop()}:${(d.lineNumber ?? 0) + 1})` : '';
+		bad('exception', `${String(what).split('\n')[0].slice(0, 200)}${at}`);
+	}));
+	// Log.entryAdded catches what the other two do not: CSP refusals, mixed
+	// content blocks, and a favicon nobody asked for. Network noise is already
+	// reported above, so drop that source rather than saying it twice.
+	browser.on('Log.entryAdded', only(p => {
+		if (p.entry.level !== 'error' || p.entry.source === 'network') return;
+		bad('log', `${p.entry.source}: ${String(p.entry.text).slice(0, 200)}`);
+	}));
+
+	const deadline = Date.now() + opt.timeout * 1000;
+	const left = () => deadline - Date.now();
+	// A page that wedges the renderer never answers Runtime.evaluate, so every
+	// command carries the same deadline. Running out of it is a fact about the
+	// page -- exit 1 -- and not a fact about the checker, which is exit 2.
+	const guard = async (what, promise) => {
+		const timer = new Promise((_, rej) => setTimeout(() => {
+			const e = new Error(`the page stopped answering after ${opt.timeout}s, while ${what}`);
+			e.timeout = true;
+			rej(e);
+		}, Math.max(1, left())));
+		return Promise.race([promise, timer]);
+	};
+
+	await send('Emulation.setDeviceMetricsOverride',
+		{ width: opt.wide, height: 900, deviceScaleFactor: 1, mobile: false });
+
+	let loaded = false;
+	browser.on('Page.loadEventFired', only(() => { loaded = true; }));
+	const nav = await guard('navigating', send('Page.navigate', { url: opt.url }));
+	if (nav.errorText) {
+		bad('request', `could not load ${opt.url}: ${nav.errorText}`);
+		return report({ bytes, requests });
+	}
+
+	// Loaded means the load event fired and nothing has been in flight for a
+	// beat. A page that keeps a stream open never goes quiet, so the deadline
+	// is the other half of the answer and a timeout is a failure, not a pass.
+	while (left() > 0) {
+		if (loaded && inflight === 0 && Date.now() - lastQuiet > opt.settle) break;
+		await sleep(50);
+	}
+	if (left() <= 0) {
+		bad('timeout', `the page was still loading after ${opt.timeout}s -- ${inflight} request(s) in flight`);
+		return report({ bytes, requests });
+	}
+
+	const evaluate = expr => guard('evaluating the audit', send('Runtime.evaluate',
+		{ expression: expr, returnByValue: true, awaitPromise: true }))
+		.then(r => {
+			if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
+			return r.result.value;
+		});
+
+	const audit = await evaluate(AUDIT);
+	for (const p of audit.problems) bad(p.kind, p.detail);
+
+	// ---- the phone. Not a preference: a page you cannot read at 390px is
+	// broken for most of the people who will open it.
+	await send('Emulation.setDeviceMetricsOverride',
+		{ width: opt.narrow, height: 844, deviceScaleFactor: 2, mobile: true });
+	await sleep(250);
+	// Not window.innerWidth. Under phone emulation the browser honours the
+	// viewport meta and *widens the layout viewport to fit the overflow*, so
+	// innerWidth comes back as 964 on a 390px screen and scrollWidth ==
+	// innerWidth for a page that is plainly broken. clientWidth is the layout
+	// viewport and stays 390, which is the number the comparison meant all along.
+	const over = await evaluate(`({
+		w: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0),
+		v: Math.min(document.documentElement.clientWidth, window.visualViewport.width)
+	})`);
+	if (over.w > over.v + 1)
+		bad('layout', `${over.w}px of content in a ${opt.narrow}px viewport -- it scrolls sideways on a phone`);
+
+	// ---- both colour schemes must render. A page that only styles one gets
+	// the browser's default for the other, which is usually black on black.
+	for (const scheme of ['dark', 'light']) {
+		await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] });
+		await sleep(150);
+		const seen = await evaluate(`(() => {
+			const cs = getComputedStyle(document.body);
+			return { bg: cs.backgroundColor, fg: cs.color };
+		})()`);
+		if (!seen.bg) bad('scheme', `no computed background in ${scheme} mode`);
+	}
+	await send('Emulation.setEmulatedMedia', { features: [] });
+	await send('Emulation.setDeviceMetricsOverride',
+		{ width: opt.wide, height: 900, deviceScaleFactor: 1, mobile: false });
+	await sleep(150);
+
+	// ---- does anything here react. A layout is not an app, and the most
+	// convincing failure a model produces is a beautiful page wired to nothing.
+	const before = await evaluate(DIGEST);
+	let alive = false, tried = [];
+	if (audit.controls > 0) {
+		for (let n = 0; n < Math.min(opt.clicks, audit.controls) && !alive; n++) {
+			const target = await evaluate(CLICK(n));
+			if (!target || target.w === 0) continue;
+			tried.push(target.name || `control ${n + 1}`);
+			for (const type of ['mousePressed', 'mouseReleased'])
+				await send('Input.dispatchMouseEvent',
+					{ type, x: target.x, y: target.y, button: 'left', clickCount: 1 });
+			await sleep(400);
+			const after = await evaluate(DIGEST);
+			if (after.digest !== before.digest || after.href !== before.href) alive = true;
+		}
+		if (!alive) bad('inert', `clicking ${tried.length ? tried.map(t => `"${t}"`).join(', ') : 'the controls'} changed nothing on the page`);
+	} else {
+		await sleep(opt.alive);
+		const after = await evaluate(DIGEST);
+		alive = after.digest !== before.digest || audit.animations > 0;
+		if (!alive) bad('inert', 'the page has no controls, nothing animates, and nothing changes on its own');
+	}
+
+	if (bytes > opt.budget)
+		bad('budget', `${(bytes / 1000).toFixed(0)} kB over the wire, budget is ${(opt.budget / 1000).toFixed(0)} kB -- something is bundled in here`);
+
+	if (opt.shot) {
+		const { data } = await guard('taking a screenshot',
+			send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }));
+		writeFileSync(opt.shot, Buffer.from(data, 'base64'));
+	}
+
+	return report({ bytes, requests });
+}
+
+// One broken URL polled on a timer is one problem, not sixty-eight. Fold
+// repeats and say how many -- a page that fails this hard is exactly the page
+// whose one useful line must not be buried, and a count is not a silent cut.
+function fold(list) {
+	const seen = new Map();
+	for (const p of list) {
+		const norm = /https?:\/\//.test(p.detail) ? p.detail.replace(/\?[^\s]*/g, '') : p.detail;
+		const key = `${p.kind} ${norm}`;
+		const had = seen.get(key);
+		if (had) had.n++;
+		else seen.set(key, { kind: p.kind, detail: norm, verbatim: p.detail, n: 1 });
+	}
+	return [...seen.values()];
+}
+
+function report({ bytes, requests }) {
+	const kb = `${(bytes / 1000).toFixed(0)} kB`;
+	const folded = fold(problems);
+	if (opt.json) {
+		process.stdout.write(JSON.stringify({
+			url: opt.url, ok: problems.length === 0, bytes, requests,
+			problems: folded.map(({ kind, detail, n }) => ({ kind, detail, count: n })),
+		}) + '\n');
+		return problems.length === 0 ? 0 : 1;
+	}
+	if (!problems.length) {
+		process.stdout.write(`ok ${opt.url} (${kb}, ${requests} requests)\n`);
+		return 0;
+	}
+	// Every reason, never a bare count. A check that says "3 problems" is a
+	// check somebody has to re-run by hand before they can act on it.
+	process.stdout.write(`FAIL ${opt.url} (${kb}, ${requests} requests)\n`);
+	for (const p of folded.slice(0, 40))
+		process.stdout.write(`  ${p.kind}: ${p.n > 1 ? `${p.detail} (${p.n} times)` : p.verbatim}\n`);
+	if (folded.length > 40)
+		process.stdout.write(`  ... and ${folded.length - 40} more, all of them in -json\n`);
+	return 1;
+}
+
+try {
+	process.exitCode = await main();
+} catch (e) {
+	// A check that cannot run has not said no. Exit 2 so a supervisor can tell
+	// "the page is not done" from "the browser died", and never retry the wrong one.
+	if (e.timeout) {
+		bad('timeout', e.message);
+		process.exitCode = report({ bytes: 0, requests: 0 });
+	} else {
+		process.stderr.write(`page-check: ${e.message}\n`);
+		process.exitCode = 2;
+	}
+}
+cleanup();
+process.exit(process.exitCode);

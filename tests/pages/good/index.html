@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Counter</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.5 system-ui, sans-serif;
+    background: light-dark(#fff, #111);
+    color: light-dark(#111, #eee);
+    margin: 0; display: grid; place-items: center; min-height: 100dvh;
+  }
+  button {
+    font: inherit; padding: .6rem 1.2rem; border-radius: .5rem;
+    border: 1px solid currentColor; background: transparent; color: inherit;
+  }
+  button:focus-visible { outline: 3px solid currentColor; outline-offset: 2px; }
+</style>
+<body>
+  <main>
+    <h1 id="n">0</h1>
+    <button id="up">Add one</button>
+  </main>
+<script type="module">
+  const n = document.getElementById('n');
+  document.getElementById('up').addEventListener('click', () => {
+    n.textContent = String(Number(n.textContent) + 1);
+  });
+</script>

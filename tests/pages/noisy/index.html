@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Counter</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; background: light-dark(#fff, #111);
+         color: light-dark(#111, #eee); margin: 0; padding: 2rem; }
+</style>
+<body>
+  <main><h1 id="n">0</h1><button id="up">Add one</button></main>
+<script type="module">
+  const n = document.getElementById('n');
+  document.getElementById('up').addEventListener('click', () => {
+    n.textContent = String(Number(n.textContent) + 1);
+  });
+  console.error('could not restore the saved count');
+  // And an exception nobody catches, which is the other half of case 6.
+  setTimeout(() => { window.nothingHere.read(); }, 10);
+</script>

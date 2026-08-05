@@ -1,0 +1,96 @@
+#!/bin/sh
+# tests/ply-stub -- stands in for ply, so the suite never reaches a model.
+#
+# $STUB_PLY says what the build should do: "pass" writes a page that page-check
+# is happy with, "fail" writes one it is not and exits 2 the way ply does when
+# a check is still failing. Everything around the loop -- staging, promotion,
+# the commit, the refusal to publish -- is then checkable with no network.
+#
+# It also records its own argv, because case 17 asks a question about it: a
+# chat message must never arrive here as an argument.
+set -eu
+
+printf '%s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+
+dir=. check= before=no
+# Captured before the loop eats it. The goal is the last argument and the loop
+# shifts every argument away, so a later `case "$*"` matches the empty string
+# and every edit silently took the build path instead.
+all=$*
+while [ $# -gt 0 ]; do
+	case $1 in
+	-C) dir=$2; shift 2 ;;
+	-check) check=$2; shift 2 ;;
+	-B) before=yes; shift ;;
+	-t | -s | -cycles | -timeout | -m | -f | -S | -cap | -turns) shift 2 ;;
+	*) shift ;;
+	esac
+done
+
+# ply runs the check before the first turn and stops if it already passes.
+# A stub that skipped this would be a stub that passes a caller which forgot
+# -B -- and the caller that forgets -B answers every request to change a live
+# page with `nothing to do`, because the live page already passes. A double
+# that is kinder than the program it stands in for does not find bugs.
+if [ "$before" = no ] && [ -n "$check" ] && ( eval "$check" >/dev/null 2>&1 ); then
+	printf 'stub: nothing to do\n' >&2
+	exit 0
+fi
+
+case ${STUB_PLY:-pass} in
+fail)
+	cat >"$dir/index.html" <<'EOF'
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Nope</title>
+<body><main><h1>0</h1><button>Add one</button></main>
+EOF
+	printf 'stub: the check is still failing\n' >&2
+	exit 2
+	;;
+*)
+	# It deletes SPEC.md, because the real one did. The goal tells the model to
+	# leave nothing in the site that is not part of the app, and a model that
+	# reads that carefully removes the spec -- correctly, from an instruction
+	# that was wrong. Cases 9 and 12 assert the spec survives anyway, so this
+	# line is what keeps the guard honest rather than the wording of a prompt.
+	rm -f "$dir/SPEC.md"
+	# An edit is handed the request in .change, alone. If it is not there, the
+	# model has nothing to act on but a growing SPEC.md -- which is the bug
+	# this whole arrangement exists to prevent.
+	#
+	# And an edit *edits*. A stub that rewrote the whole file would be the very
+	# behaviour the edit goal exists to stop, and the gauge that measures it
+	# would have nothing to measure.
+	case "$all" in
+	*"smallest edit"*)
+		[ -s "$dir/.change" ] || { printf 'stub: no .change for an edit\n' >&2; exit 2; }
+		[ -s "$dir/index.html" ] || { printf 'stub: nothing to edit\n' >&2; exit 2; }
+		printf '<!-- %s -->\n' "$(head -1 "$dir/.change")" >>"$dir/index.html"
+		exit 0
+		;;
+	esac
+	cat >"$dir/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Counter</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 0; padding: 2rem;
+         background: light-dark(#fff, #111); color: light-dark(#111, #eee); }
+  button { font: inherit; color: inherit; background: transparent;
+           border: 1px solid currentColor; border-radius: .5rem; padding: .5rem 1rem; }
+</style>
+<body>
+  <main><h1 id="n">0</h1><button id="up">Add one</button></main>
+<script type="module">
+  const n = document.getElementById('n');
+  document.getElementById('up').addEventListener('click', () => {
+    n.textContent = String(Number(n.textContent) + 1);
+  });
+</script>
+EOF
+	exit 0
+	;;
+esac

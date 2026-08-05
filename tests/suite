@@ -1,0 +1,551 @@
+#!/bin/sh
+# tests/suite -- the definition of done, offline.
+#
+# No tailnet, no chat network, no model provider, no credentials. A tailscale
+# stub keeps state so reconcile can be run twice and asked whether it did
+# anything the second time; a ply stub writes a page that passes or one that
+# does not, so promotion, refusal and the commit are all checkable without a
+# model. The one real dependency is a browser, because page-check's whole job
+# is to open the page in one.
+set -u
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT" || exit 2
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/pitch-check.XXXXXX")
+SERVE_PIDS=
+cleanup() {
+	for p in $SERVE_PIDS; do kill "$p" 2>/dev/null; done
+	pkill -x "$WORK/matterbridge" 2>/dev/null
+	rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+# The suite reads its own configuration, never the one on this machine. Adding
+# PITCH_HOST to ~/.config/pitch/env turned two cases red on a tree that had not
+# changed -- which is a check reporting a fact about the developer rather than
+# about the code, and the worst kind of false negative because it is *correct*.
+PITCH_CONFIG=$WORK/pitch.env
+export PITCH_CONFIG
+: >"$PITCH_CONFIG"
+unset PITCH_HOST PITCH_PORT PITCH_MODEL PITCH_SMALL_MODEL PITCH_BUDGET 2>/dev/null || true
+
+N=0 FAILED=0 DESC= WHY=
+try() { N=$((N + 1)); DESC=$1; WHY=; }
+no() { [ -n "$WHY" ] || WHY=$1; }
+verdict() {
+	if [ -z "$WHY" ]; then
+		printf 'ok   %2d  %s\n' "$N" "$DESC"
+	else
+		FAILED=$((FAILED + 1))
+		printf 'FAIL %2d  %s\n         %s\n' "$N" "$DESC" "$WHY"
+	fi
+}
+
+# A server on a port nobody chose, so the suite cannot collide with a running
+# pitch-serve or with another copy of itself.
+serve_on() {
+	pf=$WORK/port.$$.$N
+	PITCH_PORT_FILE=$pf ./bin/pitch-serve -p 0 -r "$1" >/dev/null 2>&1 &
+	SERVE_PIDS="$SERVE_PIDS $!"
+	n=0
+	while [ ! -s "$pf" ]; do
+		n=$((n + 1)); [ "$n" -gt 100 ] && return 1
+		sleep 0.1
+	done
+	cat "$pf"
+}
+
+code() { curl -s -o /dev/null -w '%{http_code}' --path-as-is "$1"; }
+header() { curl -sI --path-as-is "$1" | tr '[:upper:]' '[:lower:]' | sed -n "s/^$2: *//p" | tr -d '\r'; }
+
+BAD_NAMES='../../etc/passwd
+a;rm -rf ~
+.
+
+Pomodoro
+-lead
+foo-
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+
+# --------------------------------------------------------------- 1. lint
+
+try "lint: shell, javascript, the skill, the modes, the example TOML"
+for f in bin/pitch bin/pitch-chat bin/check tests/suite tests/ply-stub tests/ask-stub lib/common.sh; do
+	sh -n "$f" 2>/dev/null || no "$f is not valid sh"
+done
+for f in bin/pitch-serve bin/page-check; do
+	node --check "$f" >/dev/null 2>&1 || no "$f is not valid javascript"
+done
+# compile() rather than py_compile: py_compile writes a __pycache__ into the
+# tree it was asked to check, and a check that leaves litter behind is a check
+# somebody adds to .gitignore instead of fixing.
+python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
+	tests/tailscale-stub >/dev/null 2>&1 || no "tests/tailscale-stub does not compile"
+brief lint -q -strict skills/web-house 2>/dev/null || no "skills/web-house does not lint"
+for f in bin/pitch bin/pitch-serve bin/page-check bin/pitch-chat bin/check tests/suite \
+	tests/ply-stub tests/ask-stub tests/tailscale-stub; do
+	[ -x "$f" ] || no "$f is not executable -- a handler that is not executable is not a handler"
+done
+python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1],"rb"))' \
+	etc/gateway.toml.example 2>/dev/null || no "etc/gateway.toml.example is not TOML"
+verdict
+
+# ------------------------------------------------- 2. the name is hostile
+
+try "a hostile name is refused identically by every program that takes one"
+SERVE_ROOT=$WORK/serveroot
+mkdir -p "$SERVE_ROOT/types" "$SERVE_ROOT/iso" "$SERVE_ROOT/plain" "$SERVE_ROOT/esc"
+printf 'secret\n' >"$WORK/secret.txt"
+for d in types iso plain esc; do
+	printf '<!doctype html><html lang=en><title>t</title><body>hi\n' >"$SERVE_ROOT/$d/index.html"
+done
+printf 'export const a = 1;\n' >"$SERVE_ROOT/types/m.js"
+printf '\0asm\1\0\0\0' >"$SERVE_ROOT/types/m.wasm"
+printf 'body{color:#000}\n' >"$SERVE_ROOT/types/m.css"
+printf 'binary\n' >"$SERVE_ROOT/types/m.bin"
+printf 'require-corp\n' >"$SERVE_ROOT/iso/.isolate"
+ln -sf "$WORK/secret.txt" "$SERVE_ROOT/esc/out"
+
+PORT=$(serve_on "$SERVE_ROOT") || no "the server would not start"
+printf '%s\n' "$BAD_NAMES" | while IFS= read -r n; do
+	( . ./lib/common.sh; valid_name "$n" ) 2>/dev/null &&
+		printf 'shell accepted "%s"\n' "$n"
+	enc=$(printf '%s' "$n" | jq -sRr @uri)
+	c=$(code "http://127.0.0.1:$PORT/$enc/")
+	case $c in 403 | 404 | 301) ;; *) printf 'the server answered %s for "%s"\n' "$c" "$n" ;; esac
+	ln -sf "$ROOT/bin/pitch-chat" "$WORK/link" 2>/dev/null
+	:
+done >"$WORK/names.out" 2>&1
+[ -s "$WORK/names.out" ] && no "$(head -2 "$WORK/names.out" | tr '\n' ';')"
+# and the good ones still work, or the rule is merely "no"
+( . ./lib/common.sh; valid_name clock && valid_name a && valid_name my-app-2 ) ||
+	no "a legitimate name was refused"
+[ "$(code "http://127.0.0.1:$PORT/plain/")" = 200 ] || no "a legitimate site was refused"
+verdict
+
+# --------------------------------------------- 3. no walking out of a site
+
+try "pitch-serve serves the app, and not pitch's own files inside it"
+printf 'secret plans\n' >"$SERVE_ROOT/plain/SPEC.md"
+: >"$SERVE_ROOT/plain/.public"
+for u in "/plain/SPEC.md" "/plain/.public" "/plain/.isolate" "/plain/.domain"; do
+	c=$(code "http://127.0.0.1:$PORT$u")
+	[ "$c" = 404 ] || no "$u answered $c -- a public site would hand out what was asked for"
+done
+[ "$(code "http://127.0.0.1:$PORT/plain/")" = 200 ] || no "the app itself stopped being served"
+rm -f "$SERVE_ROOT/plain/SPEC.md" "$SERVE_ROOT/plain/.public"
+verdict
+
+try "pitch-serve cannot be walked out of a site"
+for u in "/plain/../../secret.txt" "/plain/%2e%2e/%2e%2e/secret.txt" \
+	"/plain//etc/passwd" "/esc/out"; do
+	body=$(curl -s --path-as-is "http://127.0.0.1:$PORT$u")
+	case $body in *secret*) no "$u served $WORK/secret.txt" ;; esac
+	case $body in *root:*) no "$u served /etc/passwd" ;; esac
+done
+verdict
+
+# ------------------------------------------------------- 4. content types
+
+try "content types, and .wasm above all"
+[ "$(header "http://127.0.0.1:$PORT/types/m.wasm" content-type)" = "application/wasm" ] ||
+	no "a .wasm is not application/wasm -- instantiateStreaming refuses it"
+case $(header "http://127.0.0.1:$PORT/types/m.js" content-type) in
+text/javascript*) ;; *) no ".js is not text/javascript" ;;
+esac
+case $(header "http://127.0.0.1:$PORT/types/index.html" content-type) in
+*charset=utf-8) ;; *) no ".html carries no charset" ;;
+esac
+[ "$(header "http://127.0.0.1:$PORT/types/m.bin" content-type)" = "application/octet-stream" ] ||
+	no "an unknown extension is not octet-stream"
+verdict
+
+# ------------------------------------------------- 5. isolation is opt-in
+
+try "cross-origin isolation is opt-in, and off means absent"
+[ "$(header "http://127.0.0.1:$PORT/iso/" cross-origin-opener-policy)" = "same-origin" ] ||
+	no ".isolate did not turn COOP on"
+[ "$(header "http://127.0.0.1:$PORT/iso/" cross-origin-embedder-policy)" = "require-corp" ] ||
+	no ".isolate did not turn COEP on"
+[ -z "$(header "http://127.0.0.1:$PORT/plain/" cross-origin-opener-policy)" ] ||
+	no "COOP is set on a site with no .isolate"
+verdict
+
+# -------------------------------------------- 6, 7, 8. what page-check says
+
+PAGES_PORT=$(serve_on "$ROOT/tests/pages") || PAGES_PORT=
+
+pc() { ./bin/page-check -timeout "${2:-25}" "http://127.0.0.1:$PAGES_PORT/$1/" 2>&1; }
+
+try "page-check passes a page that is done, and says why for one that is not"
+[ -n "$PAGES_PORT" ] || no "the fixture server would not start"
+out=$(pc good); [ $? -eq 0 ] || no "the good fixture failed: $out"
+for pair in 'noisy console' 'noisy exception' 'broken request' 'wide layout' \
+	'nameless a11y' 'dim contrast' 'insecure mixed' 'insecure pin'; do
+	set -- $pair
+	out=$(pc "$1")
+	[ $? -eq 0 ] && { no "$1 passed and must not"; continue; }
+	case $out in *"$2:"*) ;; *) no "$1 failed, but not for $2: $(printf '%s' "$out" | tr '\n' ';')" ;; esac
+done
+verdict
+
+try "an inert page fails, and a page with no controls at all does not"
+out=$(pc inert)
+[ $? -eq 0 ] && no "the inert fixture passed"
+case $out in *inert:*) ;; *) no "inert did not fail as inert: $out" ;; esac
+out=$(pc alive)
+[ $? -eq 0 ] || no "a clock, which has no controls and is correct, was called inert: $out"
+verdict
+
+try "a page that never settles is bounded, and reported as a timeout"
+out=$(./bin/page-check -timeout 4 "http://127.0.0.1:$PAGES_PORT/slow/" 2>&1)
+st=$?
+[ "$st" = 1 ] || no "expected exit 1 for a page that never loads, got $st"
+case $out in *timeout:*) ;; *) no "it did not say it timed out: $(printf '%s' "$out" | tail -1)" ;; esac
+case $out in *"(6"*times*) ;; *[0-9]" times)"*) ;; *) no "68 identical 404s were not folded" ;; esac
+verdict
+
+# ------------------------------------------------------ 9-12, 14. building
+
+# A whole tree of its own, with the stubs standing in for the model.
+NEWROOT=$WORK/tree
+mkdir -p "$NEWROOT"
+cp -R "$ROOT/skills" "$NEWROOT/skills"
+export PITCH_ROOT=$NEWROOT
+export ASK=$ROOT/tests/ask-stub
+export PLY=$ROOT/tests/ply-stub
+export PITCH_TAILSCALE=$ROOT/tests/tailscale-stub
+export STUB_STATE=$WORK/ts.json
+export STUB_LOG=$WORK/stub.log
+export PITCH_PAGE_TIMEOUT=25
+
+try "the first run on an empty tree builds, commits, and creates what it needs"
+[ -e "$NEWROOT/sites" ] && no "the tree was not empty to begin with"
+url=$(./bin/pitch new counter 'a counter' 2>"$WORK/new.err")
+st=$?
+[ "$st" = 0 ] || no "pitch new failed on an empty tree: $(tail -2 "$WORK/new.err")"
+[ -f "$NEWROOT/sites/counter/index.html" ] || no "no index.html was published"
+[ -f "$NEWROOT/sites/counter/SPEC.md" ] || no "no SPEC.md was kept"
+[ -d "$NEWROOT/sites/counter/.git" ] || no "the site is not a git repository"
+[ -d "$NEWROOT/build/counter" ] && no "the staging tree was left behind"
+[ "$(ls "$NEWROOT"/log/counter/*.jsonl 2>/dev/null | wc -l)" -ge 1 ] || no "nothing was logged"
+# The doctrine has to reach the call that writes the spec. It did not for a
+# long time: `BRIEF_PATH=x ask -S "$(brief cat web-house)"` expands the
+# substitution in *this* shell, where the prefix has not been applied, so brief
+# ran with no path and said so on a stderr nobody was reading.
+grep -q "import map" "$STUB_LOG" ||
+	no "the spec was written without web-house in its system prompt"
+case $url in https://mac.tail1234.ts.net/counter/) ;; *) no "the url printed was \"$url\"" ;; esac
+verdict
+
+try "an existing name is refused, never overwritten"
+before=$(cat "$NEWROOT/sites/counter/index.html")
+./bin/pitch new counter 'something else' >/dev/null 2>&1 && no "it accepted a name that exists"
+[ "$(cat "$NEWROOT/sites/counter/index.html")" = "$before" ] || no "the existing site was changed"
+verdict
+
+try "a failed check publishes nothing, and the last good page is still up"
+head=$(git -C "$NEWROOT/sites/counter" rev-parse HEAD)
+before=$(cat "$NEWROOT/sites/counter/index.html")
+STUB_PLY=fail ./bin/pitch say counter 'make it worse' >/dev/null 2>&1 &&
+	no "a failing build reported success"
+[ "$(git -C "$NEWROOT/sites/counter" rev-parse HEAD)" = "$head" ] || no "a failing build committed"
+[ "$(cat "$NEWROOT/sites/counter/index.html")" = "$before" ] || no "a failing build changed the live page"
+[ -d "$NEWROOT/build/counter" ] && no "the failed staging tree was left behind"
+verdict
+
+try "a change is an edit, not a rebuild, and says how much of the file moved"
+: >"$STUB_LOG"
+out=$(./bin/pitch say counter 'make the button bigger' 2>"$WORK/say.err") ||
+	no "a passing change failed: $(tail -2 "$WORK/say.err")"
+# The goal handed over for a change must be the edit one. Handing over the
+# build goal is what made every request rewrite the whole app: SPEC.md grows
+# one section per request, so "build the app SPEC.md describes" becomes "redo
+# all of it" by the fifth message.
+grep -q "smallest edit" "$STUB_LOG" ||
+	no "a change was given the build goal, not the edit goal: $(head -c 200 "$STUB_LOG")"
+grep -q -- "-compact" "$STUB_LOG" ||
+	no "ply was not given -compact, so a long build dies of its own transcript"
+[ -e "$NEWROOT/sites/counter/.change" ] &&
+	no ".change was published with the site"
+case $out in
+*"lines changed"*) ;;
+*) no "no gauge of how much of the file moved: $out" ;;
+esac
+[ "$(git -C "$NEWROOT/sites/counter" log -1 --format=%s)" = "make the button bigger" ] ||
+	no "the commit message is not the message that asked for it"
+[ "$(git -C "$NEWROOT/sites/counter" log -1 --format=%s)" = "make the button bigger" ] ||
+	no "the commit does not carry what was asked for"
+./bin/pitch back counter >/dev/null 2>&1 || no "back would not revert"
+[ "$(git -C "$NEWROOT/sites/counter" log -1 --format=%s)" != "make the button bigger" ] ||
+	no "back did not revert"
+verdict
+
+try "one build per site: a second change is refused, not run on top of the first"
+# The staging path is fixed per site, and the chat handler forks past heed's
+# per-gateway lock -- so two messages a minute apart ran concurrently, and the
+# second's `rm -rf` deleted the first's working tree out from under ply.
+mkdir -p "$NEWROOT/state/counter.lock"
+date -u +%s >"$NEWROOT/state/counter.lock/at"
+out=$(./bin/pitch say counter 'while another is running' 2>&1) &&
+	no "a second change ran while one was already building"
+case $out in *"already building"*) ;; *) no "the refusal does not say why: $out" ;; esac
+out=$(./bin/pitch land counter 2>&1) && no "land ran while a build held the lock"
+rm -rf "$NEWROOT/state/counter.lock"
+# and a lock older than any build could be is not a lock
+mkdir -p "$NEWROOT/state/counter.lock"
+printf '0\n' >"$NEWROOT/state/counter.lock/at"
+./bin/pitch say counter 'after a stale lock' >/dev/null 2>&1 ||
+	no "a stale lock was never broken"
+verdict
+
+try "land folds a run of tweaks into one commit and rewrites the spec"
+n0=$(git -C "$NEWROOT/sites/counter" rev-list --count HEAD)
+[ "$n0" -ge 3 ] || no "expected several commits to land, found $n0"
+tree0=$(git -C "$NEWROOT/sites/counter" rev-parse HEAD^{tree})
+out=$(./bin/pitch land counter 2>&1) || no "land failed: $out"
+n1=$(git -C "$NEWROOT/sites/counter" rev-list --count HEAD)
+[ "$n1" -lt "$n0" ] || no "land did not fold anything: $n0 commits before, $n1 after"
+# The artifact must not move. That is the whole promise of this shape.
+[ "$(git -C "$NEWROOT/sites/counter" rev-parse HEAD^{tree})" != "$tree0" ] ||
+	no "land did not rewrite SPEC.md -- the tree is unchanged"
+[ "$(cat "$NEWROOT/sites/counter/index.html")" = "$(git -C "$NEWROOT/sites/counter" show "$tree0:index.html")" ] ||
+	no "land changed the app; it may only change the spec and the history"
+git -C "$NEWROOT/sites/counter" rev-parse -q --verify landed >/dev/null ||
+	no "no landed tag, so the next run has nothing to measure from"
+out=$(./bin/pitch land counter 2>&1) && no "landing twice with nothing in between was allowed"
+case $out in *"nothing to land"*) ;; *) no "the refusal does not say why: $out" ;; esac
+verdict
+
+try "drop throws away everything since the last landing"
+./bin/pitch say counter 'a tweak to abandon' >/dev/null 2>&1 || no "the tweak failed"
+head0=$(git -C "$NEWROOT/sites/counter" rev-parse landed)
+./bin/pitch drop counter >/dev/null 2>&1 || no "drop failed"
+[ "$(git -C "$NEWROOT/sites/counter" rev-parse HEAD)" = "$head0" ] ||
+	no "drop did not return to the landed commit"
+out=$(./bin/pitch drop counter 2>&1) && no "dropping with nothing to drop was allowed"
+case $out in *"nothing to drop"*) ;; *) no "the refusal does not say why: $out" ;; esac
+verdict
+
+try "doctor asks the port, and knows a stale server from a launchd one"
+# A real server on a port of its own, because doctor asks the port rather than
+# a pid file: launchd writes no pid file of ours, and consulting one reported
+# "not running" about the ordinary install.
+DPORT=$(serve_on "$NEWROOT/sites") || no "the doctor's server would not start"
+printf 'PITCH_PORT=%s\n' "$DPORT" >"$PITCH_CONFIG"
+
+printf '1\n' >"$NEWROOT/.serve.stamp"          # started by pitch up, since moved on
+out=$(./bin/pitch doctor 2>&1 || true)
+case $out in
+*"older than bin/pitch-serve"*) ;;
+*) no "a stale server was reported as ok: $(printf '%s' "$out" | grep -i serve)" ;;
+esac
+
+rm -f "$NEWROOT/.serve.stamp"                  # no stamp: launchd started it
+out=$(./bin/pitch doctor 2>&1 || true)
+case $out in
+*"nothing is serving"*) no "a launchd server was reported as not running -- the ordinary install" ;;
+*"older than"*) no "a launchd server was reported as stale" ;;
+*"pitch-serve up on 127.0.0.1:$DPORT"*) ;;
+*) no "doctor said something unexpected: $(printf '%s' "$out" | grep -i serve)" ;;
+esac
+
+printf 'PITCH_PORT=%s\n' "$((DPORT + 1))" >"$PITCH_CONFIG"   # nothing there
+out=$(./bin/pitch doctor 2>&1 || true)
+case $out in
+*"nothing is serving"*) ;;
+*) no "doctor did not notice an unserved port: $(printf '%s' "$out" | grep -i serve)" ;;
+esac
+: >"$PITCH_CONFIG"
+verdict
+
+try "ls on an empty tree prints nothing and exits 0"
+empty=$WORK/empty
+mkdir -p "$empty"
+out=$(PITCH_ROOT=$empty ./bin/pitch ls 2>&1)
+[ $? -eq 0 ] || no "ls exited nonzero on an empty tree"
+[ -z "$out" ] || no "ls printed \"$out\" for an empty tree"
+verdict
+
+# ------------------------------------------------------- 13. reconcile
+
+try "reconcile is idempotent, and .public is the only difference"
+# pitch new already reconciled once, which is the point of it. Start from
+# nothing so the first run here is genuinely a first run.
+rm -f "$STUB_STATE"
+: >"$STUB_LOG"
+./bin/pitch reconcile >/dev/null 2>&1
+first=$(grep -c . "$STUB_LOG")
+[ "$first" -ge 2 ] || no "the first reconcile issued $first commands, expected serve for counter"
+grep -q -- "--set-path /counter" "$STUB_LOG" || no "counter was never served"
+: >"$STUB_LOG"
+./bin/pitch reconcile >/dev/null 2>&1
+again=$(grep -v '^serve status' "$STUB_LOG" | grep -c . || true)
+[ "$again" = 0 ] || no "the second reconcile issued $again commands: $(grep -v '^serve status' "$STUB_LOG" | head -2 | tr '\n' ';')"
+
+: >"$STUB_LOG"
+./bin/pitch open counter >/dev/null 2>&1
+grep -q "^funnel .*--https 8443 .*--set-path /counter" "$STUB_LOG" ||
+	no "open did not funnel 8443: $(grep -v '^serve status' "$STUB_LOG" | head -2 | tr '\n' ';')"
+case $(./bin/pitch ls -u counter) in
+https://mac.tail1234.ts.net:8443/counter/) ;;
+*) no "a public site's url is $(./bin/pitch ls -u counter), and must carry the port" ;;
+esac
+: >"$STUB_LOG"
+./bin/pitch shut counter >/dev/null 2>&1
+grep -q "^serve .*--https 8443 .*--set-path /counter off" "$STUB_LOG" ||
+	no "shut did not remove the funnel: $(grep -v '^serve status' "$STUB_LOG" | head -2 | tr '\n' ';')"
+verdict
+
+# ------------------------------------------------- 14. the url is the url
+
+try "the url printed is the url served"
+LIVE=$(serve_on "$NEWROOT/sites") || no "the live server would not start"
+[ "$(code "http://127.0.0.1:$LIVE/counter/")" = 200 ] || no "the site does not answer at its path"
+[ "$(code "http://127.0.0.1:$LIVE/counter")" = 301 ] ||
+	no "a path with no trailing slash is not redirected -- every relative asset would resolve one level too high"
+loc=$(header "http://127.0.0.1:$LIVE/counter" location)
+[ "$loc" = "/counter/" ] || no "the redirect goes to \"$loc\""
+./bin/page-check "http://127.0.0.1:$LIVE/counter/" >/dev/null 2>&1 ||
+	no "the published page does not pass the check it was published for"
+verdict
+
+# ----------------------------------------------------------- 15. the group
+
+try "pitch group refuses while matterbridge is holding the update queue"
+# A copy of sleep under the name the guard looks for. It is started inside a
+# subshell so job control does not print its own obituary when we kill it, and
+# it is matched with -x on the full path, because a pattern that is a substring
+# of your own filenames is a loaded gun pointed at your own tests -- hail's
+# suite killed its own bridge that way.
+cp /bin/sleep "$WORK/matterbridge"
+( "$WORK/matterbridge" 30 & ) 2>/dev/null
+sleep 0.3
+MB=$WORK/mb.toml
+mkdir -p "$WORK/handlers"
+printf '[telegram.tg]\nToken = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\n' >"$MB"
+out=$(MATTERBRIDGE_CONFIG=$MB HAIL_ROOT=$WORK ./bin/pitch group counter 2>&1)
+[ $? -eq 0 ] && no "it went ahead while matterbridge was running"
+case $out in *matterbridge*) ;; *) no "the refusal does not name matterbridge: $out" ;; esac
+case $out in *stop*) ;; *) no "the refusal does not say to stop it first: $out" ;; esac
+# The workshop is a gateway and is not a site, so it is the one name that must
+# get past the "there is no site called" guard -- without it there is no way to
+# make the first group at all.
+out=$(MATTERBRIDGE_CONFIG=$MB HAIL_ROOT=$WORK ./bin/pitch group pitch 2>&1)
+case $out in
+*"no site called"*) no "the workshop gateway was refused for not being a site" ;;
+*matterbridge*) ;;
+*) no "pitch group pitch failed for an unexpected reason: $out" ;;
+esac
+pkill -x "$WORK/matterbridge" 2>/dev/null
+verdict
+
+# ------------------------------------------------ 16. the handler is a name
+
+try "the handler learns its site from HAIL_GATEWAY or its own name, and never from a host path"
+mkdir -p "$WORK/handlers"
+ln -sf "$ROOT/bin/pitch-chat" "$WORK/handlers/counter"
+out=$(printf 'hello\n' | PITCH_ROOT=$NEWROOT HAIL_THREAD=$WORK/t.jsonl \
+	ASK=$ROOT/tests/ask-stub PATH="$ROOT/tests:$PATH" "$WORK/handlers/counter" 2>&1)
+case $out in *"no site called"*) no "argv[0] did not resolve sites/counter in $NEWROOT" ;; esac
+# heed hands the name over, and it must win: the handler it runs is a wrapper
+# script, which has no useful argv[0] at all.
+out=$(printf 'hello\n' | PITCH_ROOT=$NEWROOT HAIL_GATEWAY=counter HAIL_THREAD=$WORK/t2.jsonl \
+	ASK=$ROOT/tests/ask-stub PATH="$ROOT/tests:$PATH" ./bin/pitch-chat 2>&1)
+case $out in *"no site called"*) no "HAIL_GATEWAY did not resolve the site" ;; esac
+case $out in *"needs a site"*) no "HAIL_GATEWAY was ignored in favour of argv[0]" ;; esac
+out=$(printf 'hello\n' | PITCH_ROOT=$NEWROOT ./bin/pitch-chat 2>&1)
+[ $? -eq 0 ] && no "with neither a name nor HAIL_GATEWAY it guessed a site"
+case $out in *"pitch group"*) ;; *) no "the refusal does not say how to install it: $out" ;; esac
+out=$(printf 'hi\n' | PITCH_ROOT=$NEWROOT HAIL_GATEWAY=Pomodoro ./bin/pitch-chat 2>&1)
+[ $? -eq 0 ] && no "a gateway named with a capital was accepted"
+
+# The handler pitch writes must work on both sides of the mount, so it may not
+# contain a path that is only true on one of them. And writing it must not
+# follow a symlink that is already there: the previous version of this made
+# handlers/<name> a link to bin/pitch-chat, so re-running the command
+# overwrote pitch-chat with the wrapper, which then exec'd itself forever.
+MB2=$WORK/mb2.toml
+printf '[telegram.tg]\nToken = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\n' >"$MB2"
+decoy=$WORK/decoy
+printf 'do not overwrite me\n' >"$decoy"
+ln -sf "$decoy" "$WORK/handlers/counter"
+MATTERBRIDGE_CONFIG=$MB2 HAIL_ROOT=$WORK ./bin/pitch group counter -1009999999999 >/dev/null 2>&1
+[ "$(cat "$decoy")" = "do not overwrite me" ] ||
+	no "writing the handler followed a symlink and destroyed what it pointed at"
+h=$WORK/handlers/counter
+[ -L "$h" ] && no "the handler is still a symlink -- the link was written through, not replaced"
+if [ -f "$h" ] && [ ! -L "$h" ]; then
+	[ -x "$h" ] || no "the handler pitch wrote is not executable, so heed calls it an unknown gateway"
+	grep -q "$ROOT" "$h" &&
+		no "the handler names $ROOT, which does not exist inside the container"
+	sh -n "$h" 2>/dev/null || no "the handler pitch wrote is not valid sh"
+fi
+verdict
+
+# ------------------------------------ 17. untrusted text is never a word
+
+try "a chat message reaches ply through a file, never in argv"
+: >"$STUB_LOG"
+rm -f "$WORK/pwned"
+# Matched whole, not by fragments. An earlier version grepped for "touch" and
+# went red when the goal itself gained the word "touches" -- a check that fails
+# on the prose of the thing it is checking is a check nobody will trust twice.
+hostile="-B -sh; touch $WORK/pwned; echo qxz9-marker"
+./bin/pitch say counter "$hostile" >/dev/null 2>&1
+[ -e "$WORK/pwned" ] && no "a message ran a command"
+grep -qF -- "$hostile" "$STUB_LOG" && no "the message reached ply's argv: $(head -1 "$STUB_LOG")"
+grep -q "qxz9-marker" "$STUB_LOG" && no "part of the message reached ply's argv"
+grep -q "smallest edit" "$STUB_LOG" || no "the goal handed to ply is not the constant one"
+# It reaches the model through .change, and the record of it is the commit
+# message -- not SPEC.md, which is the specification and not a changelog.
+[ "$(git -C "$NEWROOT/sites/counter" log -1 --format=%s)" = "$hostile" ] ||
+	no "the message is not the commit message, which is where the record lives"
+grep -qF -- "$hostile" "$NEWROOT/sites/counter/SPEC.md" &&
+	no "the message was appended to SPEC.md -- that is what made the spec a changelog"
+verdict
+
+# ------------------------------------------------------- 18. the toolbox
+
+try "the toolbox pitch builds is exactly what etc/toolbox lists, and resolves here"
+listed=$(sed 's/#.*//' etc/toolbox | tr -d ' \t' | grep . | sort)
+# Built by the last build, in the tree that build used. It is derived on
+# purpose: the Mac and the container share this directory and cannot share one
+# set of symlinks, so a toolbox checked into it would be dangling on one side.
+box=$NEWROOT/build/.tools
+if [ -d "$box" ] && [ -n "$(ls -A "$box" 2>/dev/null)" ]; then
+	present=$(ls "$box" | sort)
+	[ "$listed" = "$present" ] ||
+		no "the toolbox and etc/toolbox disagree: $(printf '%s\n%s' "$listed" "$present" | sort | uniq -u | tr '\n' ' ')"
+	for t in $present; do
+		[ -e "$box/$t" ] || no "$box/$t is a dangling symlink -- the model would find no $t"
+	done
+else
+	no "no toolbox was built -- work() should have made one"
+fi
+printf '%s\n' "$listed" | grep -qx 'sh' && no "sh is in the toolbox, which would make -t meaningless rather than merely honest"
+verdict
+
+# --------------------------------------------------- 19. through a symlink
+
+try "every program still finds its own tree when invoked through a symlink"
+mkdir -p "$WORK/elsewhere"
+for p in pitch pitch-serve page-check pitch-chat; do
+	ln -sf "$ROOT/bin/$p" "$WORK/elsewhere/$p"
+done
+out=$(cd / && PITCH_ROOT=$NEWROOT "$WORK/elsewhere/pitch" ls 2>&1)
+[ $? -eq 0 ] || no "pitch through a symlink: $out"
+case $out in *counter*) ;; *) no "pitch through a symlink listed nothing: $out" ;; esac
+out=$(cd / && "$WORK/elsewhere/page-check" -h 2>&1)
+[ $? -eq 0 ] || no "page-check through a symlink: $out"
+# It reaching its own die() at all is the proof: die lives in lib/common.sh,
+# which it can only have sourced by resolving the symlink first.
+out=$(cd / && printf 'x' | PITCH_ROOT=$NEWROOT "$WORK/elsewhere/pitch-chat" 2>&1)
+case $out in *"needs a site"*) ;; *) no "pitch-chat through a symlink could not find its lib: $out" ;; esac
+verdict
+
+# ------------------------------------------------------------------ done
+
+printf '\n%d case(s), %d failed\n' "$N" "$FAILED"
+[ "$FAILED" -eq 0 ]

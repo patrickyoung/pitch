@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clock</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.5 system-ui, sans-serif;
+    background: light-dark(#fff, #111);
+    color: light-dark(#111, #eee);
+    margin: 0; display: grid; place-items: center; min-height: 100dvh;
+  }
+  time { font-size: clamp(2rem, 12vw, 6rem); font-variant-numeric: tabular-nums; }
+</style>
+<body>
+  <!-- No controls at all, and correct. A clock is an app; the aliveness gate
+       has to accept a page that changes on its own. -->
+  <main><time id="t">--:--:--</time></main>
+<script type="module">
+  const t = document.getElementById('t');
+  const tick = () => { t.textContent = new Date().toLocaleTimeString(); };
+  tick(); setInterval(tick, 250);
+</script>

@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; color: #111; background: #fff; margin: 0; padding: 2rem; }
+</style>
+<body>
+  <!-- No lang, no title, an image with no alt, a field with no label, a button
+       whose only content is an icon glyph nothing can read, and a tabindex that
+       reorders the page. Every one of these is always wrong. -->
+  <main>
+    <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">
+    <input type="text" placeholder="Search">
+    <button id="b"><svg width="16" height="16" aria-hidden="true"><rect width="16" height="16"/></svg></button>
+    <a href="#x" tabindex="3">Skip</a>
+  </main>
+<script type="module">
+  document.getElementById('b').addEventListener('click', () => {
+    document.querySelector('main').append('done');
+  });
+</script>

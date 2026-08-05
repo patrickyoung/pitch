@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.bench.pitch-reconcile - make tailscale match the tree, once a minute.
+
+  The first design said the tailscale configuration is not a daemon, because
+  the tree only changes when pitch changes it. That stopped being true the
+  moment the builder moved into the container: a site described in a chat is
+  written by another machine, on a mount the Mac cannot watch, and the Mac is
+  the only one holding the tailnet identity. Nothing else would ever notice.
+
+  This is only affordable because reconcile is idempotent by construction. It
+  computes the whole desired configuration from the tree, compares it against
+  what tailscaled already holds, and issues nothing when they agree -- so the
+  steady-state cost is one `tailscale serve status` a minute, and a site built
+  from a phone is reachable within one tick with no message crossing the mount.
+
+  Written by `just install`, which substitutes @ROOT@ and @HOME@.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bench.pitch-reconcile</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@ROOT@/bin/pitch</string>
+    <string>reconcile</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@ROOT@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:@HOME@/go/bin:@HOME@/.local/bin</string>
+    <key>PITCH_ROOT</key>
+    <string>@ROOT@</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>@ROOT@/log/reconcile.log</string>
+  <key>StandardErrorPath</key>
+  <string>@ROOT@/log/reconcile.log</string>
+</dict>
+</plist>
