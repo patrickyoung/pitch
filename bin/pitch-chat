@@ -55,6 +55,12 @@ export BRIEF_PATH
 ASK_DIR=${ASK_DIR:-$ROOT/.ask}
 export ASK_DIR
 
+# ${ASK:-ask} throughout, the family's convention. Written as a bare `ask` this
+# file reached a real model provider from inside the offline suite -- which
+# passed anyway, because the classifier falls back to `ask` when the call
+# fails, so the only symptom was a bill.
+ASK=${ASK:-ask}
+
 msg=$(cat)
 [ -n "$msg" ] || exit 0
 
@@ -63,23 +69,97 @@ msg=$(cat)
 # the same rule and this is the handler it was written for.
 say() { printf '%s\n' "$*"; }
 
+# ------------------------------------------------------------- conversation
+
+seen=${HAIL_THREAD:-/dev/null}
+seen=${seen%.jsonl}.attached
+
+# ask exits 2 on a full window, permanently: retrying the same call is the
+# failure that arrives with a bill. There is no fill percentage to read, so the
+# proxy is the size of the session on disk. A compacted thread has lost its
+# attachment, so the stamp that tracks it goes too.
+compact() {
+	[ -n "${HAIL_THREAD:-}" ] || return 1
+	fresh=$("$ASK" compact -q "$HAIL_THREAD" 2>/dev/null) || return 1
+	[ -s "$fresh" ] || return 1
+	mv -f "$fresh" "$HAIL_THREAD"
+	rm -f "$seen"
+	return 0
+}
+
+# One turn, threaded, compacted before and after if it needs to be. Both the
+# workshop and an app's group talk this way; only the system prompt differs.
+converse() {
+	if [ -f "${HAIL_THREAD:-/dev/null}" ] &&
+		[ "$(wc -c <"$HAIL_THREAD" | tr -d ' ')" -gt "${PITCH_THREAD_MAX:-500000}" ]; then
+		compact || true
+	fi
+	set +e
+	out=$(printf '%s' "$msg" | "$ASK" "$@" 2>&1)
+	st=$?
+	if [ "$st" = 2 ] && compact; then
+		out=$(printf '%s' "$msg" | "$ASK" "$@" 2>&1)
+		st=$?
+	fi
+	set -e
+	[ "$st" = 0 ] || out="that did not go through: $(printf '%s' "$out" | tail -2)"
+	say "$out"
+}
+
+# One cheap call to decide what a message wants. A model deciding what a
+# sentence means is judgment; it is never asked whether something is allowed,
+# because every verb below is one the group already owns.
+#
+# The fallback is the harmless one on purpose. A misread question costs a
+# sentence; a misread build costs three minutes and an app nobody wanted.
+classify() {
+	printf '%s' "$msg" | "$ASK" -n -q ${HAIL_MODEL:+-m "$HAIL_MODEL"} "$1" 2>/dev/null ||
+		printf 'ask\n'
+}
+
 # ------------------------------------------------------------- the workshop
 
 if [ "$SITE" = "pitch" ]; then
-	say "on it. Naming it and building it now -- a few minutes."
-	(
-		if ! name=$(pitch slug "$msg" 2>&1); then
-			printf 'could not name that one:\n%s\n' "$name" | hail pitch
-			exit 0
-		fi
-		if url=$(pitch new "$name" "$msg" 2>&1 | tail -1); then
-			printf '%s\n\nits group is "%s". Make that Telegram group, add the bot, send anything in it, then run:\npitch group %s\n' \
-				"$url" "$name" "$name" | hail pitch
-		else
-			printf '%s did not pass its check, so nothing was published:\n%s\n' \
-				"$name" "$(printf '%s' "$url" | tail -3)" | hail pitch
-		fi
-	) </dev/null >/dev/null 2>&1 &
+	# This group had no classifier at all: every message was a description of
+	# an app to build. Typing "what can you build?" into it spent three minutes
+	# producing an app called buildscope, and the log says so -- `pass: what can
+	# you build?`. One path serving two jobs, which is the same shape as the
+	# goal that rewrote an app on every edit.
+	case $(classify 'The message on stdin was sent to a workshop where new web
+	apps are described. Answer with one word and nothing else:
+
+	new    it describes an app they want built
+	list   they want to see the apps that already exist
+	ask    anything else -- a question, a greeting, thinking out loud') in
+	list)
+		out=$(pitch ls 2>&1)
+		[ -n "$out" ] && say "$out" || say "nothing built yet. Describe an app and it gets made."
+		;;
+	new)
+		say "on it. Naming it and building it now -- a few minutes."
+		(
+			if ! name=$(pitch slug "$msg" 2>&1); then
+				printf 'could not name that one:\n%s\n' "$name" | hail pitch
+				exit 0
+			fi
+			if url=$(pitch new "$name" "$msg" 2>&1 | tail -1); then
+				printf '%s\n\nits group is "%s". Make that Telegram group, add the bot, send anything in it, then run:\npitch group %s\n' \
+					"$url" "$name" "$name" | hail pitch
+			else
+				printf '%s did not pass its check, so nothing was published:\n%s\n' \
+					"$name" "$(printf '%s' "$url" | tail -3)" | hail pitch
+			fi
+		) </dev/null >/dev/null 2>&1 &
+		;;
+	*)
+		# Expert in pitch out of the file that already explains pitch. A second
+		# document describing the same thing is a second document to drift.
+		set -- -q -f "$HAIL_THREAD" \
+			-S "$("$ASK" system; brief cat hail-house 2>/dev/null; cat "$SELF/README.md" 2>/dev/null)"
+		[ -n "${HAIL_MODEL:-}" ] && set -- "$@" -m "$HAIL_MODEL"
+		converse "$@"
+		;;
+	esac
 	exit 0
 fi
 
@@ -88,13 +168,8 @@ fi
 dir=$ROOT/sites/$SITE
 [ -d "$dir" ] || { say "there is no site called $SITE yet."; exit 0; }
 
-# One cheap call, and it saves a whole ply loop on "what colour is the button".
-# A model deciding what a sentence wants is judgment; a model deciding whether
-# it is allowed to would be an authorization bug with extra steps, and it is
-# not asked that -- every verb below is one this group already owns.
-verb=$(printf '%s' "$msg" | ask -n -q ${HAIL_MODEL:+-m "$HAIL_MODEL"} \
-	'The message on stdin is about a web app somebody owns. Answer with one
-	word and nothing else:
+case $(classify 'The message on stdin is about a web app somebody owns. Answer
+	with one word and nothing else:
 
 	change   they want the app to be different
 	ask      they are asking a question about it
@@ -103,9 +178,7 @@ verb=$(printf '%s' "$msg" | ask -n -q ${HAIL_MODEL:+-m "$HAIL_MODEL"} \
 	back     they want the last change undone
 	land     they are satisfied and want this run of tweaks settled
 	drop     they want to abandon everything since the last settled version
-	url      they want the link' 2>/dev/null || echo ask)
-
-case $verb in
+	url      they want the link') in
 open) say "$(pitch open "$SITE" 2>&1)" ;;
 shut) say "$(pitch shut "$SITE" 2>&1)" ;;
 url) say "$(pitch ls -u "$SITE" 2>&1)" ;;
@@ -140,7 +213,7 @@ change)
 	fi
 	domain=$(cat "$dir/.domain" 2>/dev/null || true)
 	set -- -q -f "$HAIL_THREAD" \
-		-S "$(ask system; brief cat hail-house web-house ${domain:+"$domain"} 2>/dev/null; cat "$dir/SPEC.md" 2>/dev/null)"
+		-S "$("$ASK" system; brief cat hail-house web-house ${domain:+"$domain"} 2>/dev/null; cat "$dir/SPEC.md" 2>/dev/null)"
 	[ -n "${HAIL_MODEL:-}" ] && set -- "$@" -m "$HAIL_MODEL"
 
 	# The source is attached when the conversation starts *and* whenever it has
@@ -149,39 +222,11 @@ change)
 	# changes in, the agent was answering questions about a version it had never
 	# seen. The stamp lives beside the thread, because it is a fact about this
 	# conversation and not about the app.
-	seen=${HAIL_THREAD%.jsonl}.attached
 	is=$(mtime "$dir/index.html" 2>/dev/null || echo 0)
 	if [ ! -s "${HAIL_THREAD:-/dev/null}" ] || [ "$(cat "$seen" 2>/dev/null || true)" != "$is" ]; then
 		set -- "$@" -a "$dir/index.html"
 		printf '%s' "$is" >"$seen"
 	fi
-
-	# ask exits 2 on a full window, permanently: retrying the same call is the
-	# failure that arrives with a bill. There is no percentage to read, so the
-	# proxy is the size of the session on disk -- compact before asking when it
-	# is over budget, and again if ask says so anyway. A compacted thread has
-	# lost the attachment, so the stamp goes with it.
-	compact() {
-		fresh=$(ask compact -q "$HAIL_THREAD" 2>/dev/null) || return 1
-		[ -s "$fresh" ] || return 1
-		mv -f "$fresh" "$HAIL_THREAD"
-		rm -f "$seen"
-		return 0
-	}
-	if [ -f "$HAIL_THREAD" ] &&
-		[ "$(wc -c <"$HAIL_THREAD" | tr -d ' ')" -gt "${PITCH_THREAD_MAX:-500000}" ]; then
-		compact || true
-	fi
-
-	set +e
-	out=$(printf '%s' "$msg" | ask "$@" 2>&1)
-	st=$?
-	if [ "$st" = 2 ] && compact; then
-		out=$(printf '%s' "$msg" | ask "$@" 2>&1)
-		st=$?
-	fi
-	set -e
-	[ "$st" = 0 ] || out="that did not go through: $(printf '%s' "$out" | tail -2)"
-	say "$out"
+	converse "$@"
 	;;
 esac

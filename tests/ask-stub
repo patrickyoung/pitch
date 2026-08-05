@@ -12,6 +12,12 @@ want=$(cat 2>/dev/null || true)
 printf '%s\n' "ask $*" >>"${STUB_LOG:-/dev/null}"
 
 case " $* " in
+*"Answer with one word"*)
+	# Both classifiers ask this. $STUB_VERB is what they get back, and the
+	# default is the harmless one -- the same default the real thing falls
+	# back to when the call fails.
+	printf '%s\n' "${STUB_VERB:-ask}"
+	;;
 *"a name for the app"*)
 	printf '%s\n' "${STUB_SLUG:-counter}"
 	;;

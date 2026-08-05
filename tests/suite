@@ -461,6 +461,22 @@ case $out in *"pitch group"*) ;; *) no "the refusal does not say how to install 
 out=$(printf 'hi\n' | PITCH_ROOT=$NEWROOT HAIL_GATEWAY=Pomodoro ./bin/pitch-chat 2>&1)
 [ $? -eq 0 ] && no "a gateway named with a capital was accepted"
 
+# The workshop had no classifier: every message was a description of an app to
+# build, so "what can you build?" spent three minutes building one.
+chat() { printf '%s\n' "$2" | PITCH_ROOT=$NEWROOT HAIL_GATEWAY="$1" \
+	HAIL_THREAD=$WORK/wk.jsonl ASK=$ROOT/tests/ask-stub ./bin/pitch-chat 2>&1; }
+sites_before=$(ls "$NEWROOT/sites" | wc -l | tr -d ' ')
+out=$(STUB_VERB=ask chat pitch 'what can you build?')
+case $out in
+*"Naming it"*) no "a question to the workshop started a build" ;;
+esac
+out=$(STUB_VERB=list chat pitch 'what have I got')
+case $out in *counter*) ;; *) no "the workshop cannot list what exists: $out" ;; esac
+[ "$(ls "$NEWROOT/sites" | wc -l | tr -d ' ')" = "$sites_before" ] ||
+	no "asking the workshop a question built something"
+out=$(STUB_VERB=new chat pitch 'a metronome that taps a tempo')
+case $out in *"Naming it"*) ;; *) no "a description did not start a build: $out" ;; esac
+
 # The handler pitch writes must work on both sides of the mount, so it may not
 # contain a path that is only true on one of them. And writing it must not
 # follow a symlink that is already there: the previous version of this made
@@ -493,7 +509,8 @@ rm -f "$WORK/pwned"
 # went red when the goal itself gained the word "touches" -- a check that fails
 # on the prose of the thing it is checking is a check nobody will trust twice.
 hostile="-B -sh; touch $WORK/pwned; echo qxz9-marker"
-./bin/pitch say counter "$hostile" >/dev/null 2>&1
+./bin/pitch say counter "$hostile" >/dev/null 2>"$WORK/hostile.err" ||
+	no "the change failed: $(tail -2 "$WORK/hostile.err")"
 [ -e "$WORK/pwned" ] && no "a message ran a command"
 grep -qF -- "$hostile" "$STUB_LOG" && no "the message reached ply's argv: $(head -1 "$STUB_LOG")"
 grep -q "qxz9-marker" "$STUB_LOG" && no "part of the message reached ply's argv"

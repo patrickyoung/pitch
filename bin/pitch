@@ -290,8 +290,14 @@ $HOUSE"
 # goal ended with the model dutifully deleting SPEC.md, which is a correct
 # reading of an instruction that was wrong. Instructions are advice; this is
 # the guard.
-spec_keep() { cp "$1/SPEC.md" "$ROOT/build/.spec"; }
-spec_restore() { cp "$ROOT/build/.spec" "$1/SPEC.md"; rm -f "$ROOT/build/.spec"; }
+#
+# Kept per site. It was one shared path, `build/.spec`, which is fine for one
+# build and wrong the moment there are two: the lock is per site on purpose --
+# different apps may build at once -- so two of them raced on one backup file
+# and whichever finished first deleted the other's, leaving `cp: .spec: No such
+# file or directory` in a build that had done nothing wrong.
+spec_keep() { cp "$1/SPEC.md" "$ROOT/build/.spec-$2"; }
+spec_restore() { cp "$ROOT/build/.spec-$2" "$1/SPEC.md"; rm -f "$ROOT/build/.spec-$2"; }
 
 # git refuses to commit without an identity, and a fresh container has none:
 # `unable to auto-detect email address (got 'root@2de3dc04d088.(none)')`. The
@@ -365,10 +371,10 @@ cmd_new() {
 		one thing that must feel right, what is deliberately left out>" \
 		>"$stage/SPEC.md" || die "could not write a spec"
 	[ -s "$stage/SPEC.md" ] || { rm -rf "$stage"; die "the spec came back empty"; }
-	spec_keep "$stage"
+	spec_keep "$stage" "$name"
 
 	if work "$name" "$GOAL"; then
-		spec_restore "$stage"
+		spec_restore "$stage" "$name"
 		mkdir -p "$ROOT/sites"
 		mv "$stage" "$dir"
 		git -C "$dir" init -q
@@ -408,10 +414,10 @@ cmd_say() {
 	# is a commit whose message is the request, and every attempt is a line in
 	# log/<site>/. A third copy inside the brief was the problem, not the record.
 	printf '%s\n' "$want" >"$stage/.change"
-	spec_keep "$stage"
+	spec_keep "$stage" "$name"
 
 	if work "$name" "$EDIT_GOAL"; then
-		spec_restore "$stage"
+		spec_restore "$stage" "$name"
 		rm -f "$stage/.change"
 		# The live tree is replaced only now, at the end, by a page that has
 		# already passed. Everything except .git, because .git is the history
