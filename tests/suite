@@ -16,7 +16,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/pitch-check.XXXXXX")
 SERVE_PIDS=
 cleanup() {
 	for p in $SERVE_PIDS; do kill "$p" 2>/dev/null; done
-	pkill -x "$WORK/matterbridge" 2>/dev/null
+	kill "$(cat "$WORK/mb.pid" 2>/dev/null)" 2>/dev/null
 	rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -394,17 +394,45 @@ for c in pitch-serve tailscale; do
 	[ "$st" = down ] || no "$c is $st when nothing is running -- a dashboard may not flatter the machine"
 done
 jq -e '.components | length >= 4' "$S" >/dev/null 2>&1 || no "ward reported almost nothing"
+
+# Tokens are arithmetic over sessions ask already wrote, counted for today
+# only. A session from yesterday cannot change and must not be re-read.
+mkdir -p "$NEWROOT/log/counter"
+sess=$NEWROOT/log/counter/build-20260101T000000Z.jsonl
+printf '%s\n' \
+	'{"seq":1,"type":"session","data":{"id":"x"}}' \
+	'{"seq":2,"type":"assistant","data":{"usage":{"in":100,"out":7}}}' \
+	'{"seq":3,"type":"assistant","data":{"usage":{"in":900,"out":3}}}' >"$sess"
+old=$NEWROOT/log/counter/build-19990101T000000Z.jsonl
+printf '%s\n' '{"seq":2,"type":"assistant","data":{"usage":{"in":999999,"out":999999}}}' >"$old"
+touch -t 200001010000 "$old"
+rm -f "$NEWROOT/state/ward.tokens.json"
+PITCH_CONFIG=$WARDCFG PITCH_TAILSCALE=/nonexistent PATH="$WORK/nostub:$PATH" \
+	PITCH_ROOT=$NEWROOT ./bin/ward >/dev/null 2>&1
+got=$(jq -r '.tokens[] | select(.name=="counter") | "\(.in) \(.out)"' "$S" 2>/dev/null)
+[ "$got" = "1000 10" ] || no "tokens for counter came out as \"$got\", wanted \"1000 10\" summed over today only"
+jq -e '[.tokens[].in] | add < 999999' "$S" >/dev/null 2>&1 ||
+	no "a session from another year was counted in today's total"
+# and the second run must not re-read what has not moved
+[ -s "$NEWROOT/state/ward.tokens.json" ] || no "no token cache, so every tick re-reads every transcript"
+
+# Its page, its two caches under state/ward.*, and nothing else anywhere. The
+# marker is taken after the fixtures, so only what ward itself writes is in
+# scope -- an earlier version blamed it for files the test had just created.
+marker=$WORK/ward.marker
+: >"$marker"
+sleep 1
+PITCH_CONFIG=$WARDCFG PITCH_TAILSCALE=/nonexistent PATH="$WORK/nostub:$PATH" \
+	PITCH_ROOT=$NEWROOT ./bin/ward >/dev/null 2>&1
+stray=$(find "$NEWROOT" -newer "$marker" -type f \
+	-not -path '*/sites/ward/*' -not -name 'ward.telegram*' -not -name 'ward.tokens*' 2>/dev/null)
+[ -z "$stray" ] || no "ward wrote outside its own files: $(printf '%s' "$stray" | head -2 | tr '\n' ' ')"
 jq -e '.host != null and .now > 0' "$S" >/dev/null 2>&1 || no "ward wrote no timestamp to derive ages from"
+
 # The probe verdict is written down; the token never is.
 grep -rqi "$(sed -n 's/^ *Token *= *"\(.*\)".*/\1/p' "$WORK/mb3.toml" 2>/dev/null || echo ZZZUNLIKELY)" \
 	"$NEWROOT/sites/ward/" 2>/dev/null && no "a bot token reached the page"
 
-# It may write its own page and one probe cache, and nothing else at all.
-after=$(find "$NEWROOT" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' | sort | md5 2>/dev/null ||
-	find "$NEWROOT" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' | sort | md5sum)
-[ "$before" = "$after" ] || true   # file list, not contents: new files outside its own tree
-n=$(find "$NEWROOT" -newer "$WARDCFG" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' 2>/dev/null | wc -l | tr -d ' ')
-[ "$n" = 0 ] || no "ward wrote $n file(s) outside sites/ward: $(find "$NEWROOT" -newer "$WARDCFG" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' | head -2 | tr '\n' ' ')"
 verdict
 
 try "the page that reports the truth cannot be rewritten by a model, or published"
@@ -511,7 +539,12 @@ try "pitch group refuses while matterbridge is holding the update queue"
 # of your own filenames is a loaded gun pointed at your own tests -- hail's
 # suite killed its own bridge that way.
 cp /bin/sleep "$WORK/matterbridge"
-( "$WORK/matterbridge" 30 & ) 2>/dev/null
+# Killed by pid, never by name. `pkill -x "$WORK/matterbridge"` matches on the
+# process *name*, so a full path never matches and the fake outlived the case
+# that started it -- which passed on macOS only because the browser cases are
+# slow enough that its sleep expired first, and failed on Linux where they are
+# not. A suite that depends on which machine is faster is not a suite.
+( "$WORK/matterbridge" 30 & printf '%s' "$!" >"$WORK/mb.pid" ) 2>/dev/null
 sleep 0.3
 MB=$WORK/mb.toml
 mkdir -p "$WORK/handlers"
@@ -529,7 +562,10 @@ case $out in
 *matterbridge*) ;;
 *) no "pitch group pitch failed for an unexpected reason: $out" ;;
 esac
-pkill -x "$WORK/matterbridge" 2>/dev/null
+kill "$(cat "$WORK/mb.pid" 2>/dev/null)" 2>/dev/null
+n=0
+while pgrep -x matterbridge >/dev/null 2>&1 && [ "$n" -lt 40 ]; do n=$((n + 1)); sleep 0.1; done
+pgrep -x matterbridge >/dev/null 2>&1 && no "the fake bridge outlived its case, so the next one sees a bridge that is not there"
 verdict
 
 # ------------------------------------------------ 16. the handler is a name

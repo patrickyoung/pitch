@@ -189,6 +189,15 @@ comment says so: *python3 -m http.server was here first and was fine.*
                                    chat message that caused it as the message
       log/<name>/YYYY-MM-DD.jsonl  every build attempted and the verdict
                                    reached, one JSON object per line
+      log/<name>/build-*.jsonl     the transcript of one build, written by
+                                   ply -f. Raw: it cannot be recomputed, and
+                                   `ask replay -check` on it proves that run.
+                                   Before this it went to ~/.ply/sessions
+                                   *inside the container*, which nothing
+                                   mounts -- so every build transcript was
+                                   thrown away when the container was
+                                   recreated, and what the builds cost was
+                                   unknowable
       .ask/                        provenance; ASK_DIR points into the project
 
     derived:
@@ -437,6 +446,22 @@ the check, and each is a bug this design would otherwise have shipped.
   shell leaves the interpreter running, which `draft prove` records paying for,
   and a build's children are a server, a browser and a model client. `doctor`
   and `ward` both name a lock that has outlived any build.
+- **Job control is bash-only, and the builder runs dash.** `set -m` puts a
+  background job in its own process group in bash and does not in Debian's
+  `/bin/sh`, so the wall clock bounded nothing in the container -- which is
+  the only place builds actually run. The group comes from
+  `perl -e 'setpgrp(0,0); exec ...'` instead, which survives exec and works on
+  both. hail already reaches for perl to get `alarm(2)` without installing
+  anything; this is the same trade, and it was caught by running the suite on
+  Linux rather than by reading it.
+- **`pkill -x <full path>` never matches.** `-x` compares the process *name*,
+  so the suite's fake matterbridge outlived the case that started it. It
+  passed on macOS anyway, because the browser cases are slow enough that its
+  `sleep 30` expired first, and failed on Linux where they are not. Killed by
+  pid now, and the case fails if the fake is still alive when it ends. *A
+  suite whose verdict depends on which machine is faster is not a suite* --
+  and hail's own note about a double answering to the name in the runbook is
+  the same lesson from the other direction.
 - **`set -e` inside a function is global.** `set +e; wait; st=$?; set -e`
   restores it for the *caller* too, so a function that tidied up after itself
   clobbered a `set +e` two frames up and the script exited on a status it was

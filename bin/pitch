@@ -197,8 +197,14 @@ staging_down() {
 #
 # The group is not decoration: killing the shell leaves the interpreter
 # running, which draft prove records paying for, and a build's children are a
-# server, a browser and a model client. `set -m` gives the job a group of its
-# own so one signal reaches all of it.
+# server, a browser and a model client.
+#
+# The group comes from perl, not from `set -m`. Job control puts a background
+# job in its own group in bash and does not in dash -- and the builder runs in
+# a container whose /bin/sh is dash, so the bash-only version bounded nothing
+# where it actually matters. setpgrp survives exec, so $! is both the pid and
+# the pgid. hail already reaches for perl to get alarm(2) without installing
+# anything; this is the same trade.
 #
 # `wait || st=$?` rather than toggling set -e around it. `set -e` inside a
 # function is global, so restoring it here would clobber the caller's -- the
@@ -206,10 +212,8 @@ staging_down() {
 bounded() {
 	secs=$1
 	shift
-	set -m
-	"$@" &
+	perl -e 'setpgrp(0,0); my $p = $ARGV[0]; exec { $p } @ARGV or exit 127' "$@" &
 	pid=$!
-	set +m
 	( sleep "$secs"
 	  kill -TERM "-$pid" 2>/dev/null
 	  sleep 5
@@ -260,8 +264,16 @@ work() {
 	mkdir -p "$ROOT/build/.scratch"
 	ASK_DIR=$ROOT/.ask \
 	TMPDIR=$ROOT/build/.scratch \
+	# -f puts the transcript beside that site's verdicts instead of in a
+	# global ~/.ply/sessions, so a build is attributable to the app it built
+	# by which directory it is in -- no parsing, no guessing. It also means
+	# `ask replay -check` on it proves that run, next to the log line that
+	# recorded the verdict. A fresh name per build: ply -f continues an
+	# existing conversation, and a build is not a continuation.
+	mkdir -p "$ROOT/log/$name"
 	bounded "$PITCH_BUILD_MAX" \
 		"${PLY:-ply}" -B \
+		-f "$ROOT/log/$name/build-$(date -u +%Y%m%dT%H%M%SZ).jsonl" \
 		-C "$ROOT/build/$name" \
 		-t "$ROOT/build/.tools" \
 		-s web-house \

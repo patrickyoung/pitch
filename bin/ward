@@ -8,9 +8,12 @@
 # observing and acting are different systems -- only one of them is safe to
 # leave open in a browser tab.
 #
-# It writes exactly two things: its own page under sites/ward, and one cache
-# file in state/ holding the word "ok" or "fail" from the Telegram probe, so
-# that probe runs once a minute rather than once a tick. Nothing else, ever.
+# It writes its own page under sites/ward, and two caches under state/ward.*:
+# the word "ok" or "fail" from the Telegram probe, so that probe runs once a
+# minute rather than once a tick, and a token tally keyed by mtime so a
+# transcript that has not moved is not read again. Both are derived and can be
+# deleted at any time. Nothing else, anywhere, ever -- and a case fails if that
+# stops being true, which is how this comment stays honest.
 #
 # The question it answers is not "what is running". Everything that broke here
 # was running: heed executing code that had been replaced, matterbridge up and
@@ -167,6 +170,55 @@ else
 	add builds busy "$nb in flight" "$oldest"
 fi
 
+# ------------------------------------------------------------------ tokens
+# Every model call `ask` makes records what it cost on the assistant event, so
+# this is arithmetic over logs that already exist -- no counter, no meter, no
+# second place for the truth to live.
+#
+# Only today, and only files touched today: the question is what today cost,
+# and yesterday's sessions cannot change. That alone takes this from 46 files
+# to a handful. The rest are cached by mtime, because ward runs every ten
+# seconds and re-reading a megabyte of transcript that has not moved is the
+# kind of waste that is invisible until it is the reason the fan is on.
+#
+# No money. Prices change, ask does not record them, and a confidently wrong
+# cost is worse than an honest count of tokens.
+MID=$((NOW - NOW % 86400))
+CACHE=$ROOT/state/ward.tokens.json
+[ -s "$CACHE" ] || printf '{}\n' >"$CACHE"
+NEW='{}'
+TOK='{}'
+
+tally() { # tally FILE BUCKET
+	f=$1
+	b=$2
+	m=$(mtime "$f" 2>/dev/null || echo 0)
+	[ "$m" -ge "$MID" ] || return 0
+	hit=$(jq -c --arg f "$f" --argjson m "$m" '.[$f] | select(. != null and .m == $m)' "$CACHE" 2>/dev/null || true)
+	if [ -z "$hit" ]; then
+		hit=$(jq -r 'select(.data.usage) | "\(.data.usage.in) \(.data.usage.out)"' "$f" 2>/dev/null |
+			awk -v m="$m" 'BEGIN{i=0;o=0} {i+=$1;o+=$2} END{printf "{\"m\":%d,\"i\":%d,\"o\":%d}", m, i, o}')
+	fi
+	NEW=$(printf '%s' "$NEW" | jq -c --arg f "$f" --argjson v "$hit" '.[$f] = $v')
+	TOK=$(printf '%s' "$TOK" | jq -c --arg b "$b" --argjson v "$hit" \
+		'.[$b] = {i: ((.[$b].i // 0) + $v.i), o: ((.[$b].o // 0) + $v.o)}')
+}
+
+for d in "$ROOT"/log/*/; do
+	[ -d "$d" ] || continue
+	nm=${d%/}; nm=${nm##*/}
+	for f in "$d"build-*.jsonl; do [ -f "$f" ] && tally "$f" "$nm"; done
+done
+for f in "$ROOT"/.ask/*.jsonl; do [ -f "$f" ] && tally "$f" "(pitch itself)"; done
+for f in "$HROOT"/.ask/*.jsonl; do [ -f "$f" ] && tally "$f" "(chat)"; done
+# Sessions ply wrote before builds were given their own -f. Attributable to
+# nothing, and saying so beats quietly leaving them out of the total.
+for f in "$HOME"/.ply/sessions/*.jsonl; do [ -f "$f" ] && tally "$f" "(unattributed)"; done
+
+printf '%s\n' "$NEW" >"$CACHE"
+TOKENS=$(printf '%s' "$TOK" | jq -c 'to_entries | map({name:.key, in:.value.i, out:.value.o})
+	| sort_by(-(.in + .out))')
+
 # ------------------------------------------------------------------- sites
 SITES='[]'
 if [ -d "$ROOT/sites" ]; then
@@ -205,9 +257,9 @@ RECENT=$(
 tmp=$OUT/.state.json.$$
 jq -n --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg now "$NOW" \
 	--arg host "${host:-}" --argjson comps "$COMPS" --argjson sites "$SITES" \
-	--argjson builds "$BUILDS" --argjson recent "$RECENT" \
+	--argjson builds "$BUILDS" --argjson recent "$RECENT" --argjson tokens "$TOKENS" \
 	'{at:$at, now:($now|tonumber), host:$host, components:$comps,
-	  sites:$sites, builds:$builds, recent:$recent}' >"$tmp"
+	  sites:$sites, builds:$builds, recent:$recent, tokens:$tokens}' >"$tmp"
 mv -f "$tmp" "$OUT/state.json"
 
 # The page itself is checked into the tree and never generated, so the thing

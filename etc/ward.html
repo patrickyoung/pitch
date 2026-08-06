@@ -56,6 +56,9 @@
     <h2>sites</h2>
     <div class="scroll"><table id="sites"></table></div>
 
+    <h2>tokens today</h2>
+    <div class="scroll"><table id="tokens"></table></div>
+
     <h2>recent</h2>
     <div class="scroll"><table id="recent"></table></div>
   </div>
@@ -119,6 +122,30 @@
       [s.verdict, s.verdict === 'fail' ? 'down' : 'ok'],
       [s.subject, 'wrap'],
     ]));
+
+    // Intl rather than a hand-rolled comma splitter: the platform already
+    // knows how this reader writes a number. Tokens, never money -- prices
+    // change, ask does not record them, and a confident wrong cost is worse
+    // than an honest count.
+    const num = new Intl.NumberFormat();
+    const toks = state.tokens || [];
+    const sum = k => toks.reduce((a, t) => a + t[k], 0);
+    rows($('tokens'), [
+      ...toks.map(t => [
+        [t.name, 'name'],
+        [num.format(t.in), 'age2'],
+        ['in', 'wrap'],
+        [num.format(t.out), 'age2'],
+        ['out', 'wrap'],
+      ]),
+      ...(toks.length > 1 ? [[
+        ['total', 'name'],
+        [num.format(sum('in')), 'age2'],
+        ['in', 'wrap'],
+        [num.format(sum('out')), 'age2'],
+        ['out', 'wrap'],
+      ]] : []),
+    ]);
 
     rows($('recent'), state.recent.slice().reverse().map(r => [
       [(r.t || '').slice(11, 19), 'age2'],
