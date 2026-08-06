@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ward</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: light-dark(#fbfbf9, #14161a);
+    --fg: light-dark(#15181d, #e6e8ea);
+    --dim: light-dark(#5c6470, #949aa4);
+    --rule: light-dark(#dcdcd6, #2a2e35);
+    --ok: light-dark(#1c6b3a, #6fd08c);
+    --bad: light-dark(#a52020, #ff8b7a);
+    --warn: light-dark(#8a5a00, #f0bf6a);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.25rem 1rem 3rem;
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 78ch; margin: 0 auto; }
+  h1 { font: inherit; font-weight: 700; margin: 0; }
+  .head { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; align-items: baseline;
+          border-bottom: 1px solid var(--rule); padding-bottom: .6rem; margin-bottom: 1.1rem; }
+  .head .age { color: var(--dim); margin-left: auto; }
+  h2 { font: inherit; color: var(--dim); font-weight: 400; margin: 1.6rem 0 .4rem;
+       text-transform: lowercase; letter-spacing: .08em; }
+  /* Wide content scrolls inside its own box; the page never scrolls sideways. */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: .12rem .9rem .12rem 0; vertical-align: baseline; white-space: nowrap; }
+  td.wrap { white-space: normal; color: var(--dim); }
+  .name { font-weight: 700; }
+  .ok { color: var(--ok); }
+  .down { color: var(--bad); font-weight: 700; }
+  .stale { color: var(--warn); font-weight: 700; }
+  .busy { color: var(--warn); }
+  .age2 { color: var(--dim); font-variant-numeric: tabular-nums; }
+  a { color: inherit; }
+  footer { margin-top: 2rem; color: var(--dim); border-top: 1px solid var(--rule); padding-top: .6rem; }
+  @media (prefers-reduced-motion: no-preference) { .live { transition: opacity .2s; } }
+</style>
+<body>
+<main>
+  <div class="head">
+    <h1 id="host">ward</h1>
+    <span class="age" id="stamp">reading…</span>
+  </div>
+
+  <div id="body" hidden>
+    <div class="scroll"><table id="components"></table></div>
+
+    <h2>sites</h2>
+    <div class="scroll"><table id="sites"></table></div>
+
+    <h2>recent</h2>
+    <div class="scroll"><table id="recent"></table></div>
+  </div>
+
+  <p id="problem" class="down" hidden></p>
+
+  <footer>
+    read-only. ward reports; it cannot restart, deploy or change anything.
+  </footer>
+</main>
+<script type="module">
+  // Ages are computed here from absolute timestamps, not baked in by the
+  // generator. So the numbers tick every second between polls, and a page that
+  // has gone stale says so rather than looking fresh and lying.
+  const $ = id => document.getElementById(id);
+  let state = null, fetchedAt = 0;
+
+  const ago = secs => {
+    if (!isFinite(secs) || secs < 0) return '—';
+    if (secs < 60) return `${Math.floor(secs)}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+    return `${Math.floor(secs / 86400)}d`;
+  };
+
+  const cell = (text, cls) => {
+    const td = document.createElement('td');
+    if (cls) td.className = cls;
+    td.textContent = text;          // never innerHTML: this renders chat text
+    return td;
+  };
+  const rows = (table, list) => {
+    table.replaceChildren(...list.map(cells => {
+      const tr = document.createElement('tr');
+      cells.forEach(c => tr.append(cell(c[0], c[1])));
+      return tr;
+    }));
+  };
+
+  function render() {
+    if (!state) return;
+    // Wall-clock drift between this browser and the machine is measured once
+    // per poll and subtracted, so an age is an age and not a timezone bug.
+    const skew = (Date.now() / 1000) - (state.now + (Date.now() / 1000 - fetchedAt));
+    const since = t => (t ? (Date.now() / 1000 - fetchedAt) + (state.now - t) : NaN);
+
+    $('host').textContent = state.host || 'loopback only';
+    $('stamp').textContent = `data ${ago((Date.now() / 1000) - fetchedAt)} old`;
+
+    rows($('components'), state.components.map(c => [
+      [c.name, 'name'],
+      [c.state, c.state],
+      [c.since ? ago(since(c.since)) : '', 'age2'],
+      [c.note, 'wrap'],
+    ]));
+
+    rows($('sites'), state.sites.map(s => [
+      [s.name, 'name'],
+      [s.visibility, s.visibility === 'public' ? 'stale' : ''],
+      [s.changed ? ago(since(s.changed)) : '—', 'age2'],
+      [s.verdict, s.verdict === 'fail' ? 'down' : 'ok'],
+      [s.subject, 'wrap'],
+    ]));
+
+    rows($('recent'), state.recent.slice().reverse().map(r => [
+      [(r.t || '').slice(11, 19), 'age2'],
+      [r.who, 'name'],
+      [r.kind, ''],
+      [r.verdict, r.verdict === 'pass' || r.verdict === 'run' ? 'ok' : (r.verdict ? 'stale' : '')],
+      [r.text, 'wrap'],
+    ]));
+
+    $('body').hidden = false;
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch('state.json', { cache: 'no-store' });
+      if (!r.ok) throw new Error(`state.json returned ${r.status}`);
+      state = await r.json();
+      fetchedAt = Date.now() / 1000;
+      $('problem').hidden = true;
+      render();
+    } catch (e) {
+      // Saying nothing would leave the last good numbers on screen ticking
+      // upward as though they were still true.
+      $('problem').textContent = `ward cannot read its own state: ${e.message}`;
+      $('problem').hidden = false;
+    }
+  }
+
+  poll();
+  setInterval(poll, 5000);
+  setInterval(render, 1000);
+</script>

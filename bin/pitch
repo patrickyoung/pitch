@@ -60,6 +60,7 @@ usage: pitch <command> [arguments]
   up | down                    the static server and the tailscale config
   reconcile                    make tailscale match the tree; idempotent
   group <name> [chat-id]       give a site its own chat group
+  ward                         write the status page (read-only)
   doctor                       what is wrong, before it is wrong
 EOF
 	exit 2
@@ -153,6 +154,11 @@ landed_base() {
 	fi
 	git -C "$1" rev-list --max-parents=0 HEAD 2>/dev/null | tail -1
 }
+
+# A generated site is written by a program, not by a model. ward reports on
+# this system, so a ward a model rewrote is a dashboard that lies -- and it
+# names the machine, the gateways and every site, so it is never published.
+generated() { [ -f "$ROOT/sites/$1/.generated" ]; }
 
 site_dir() {
 	valid_name "$1" || die "\"$1\" is not a site name: lowercase letters, digits and dashes, starting with a letter, at most 32"
@@ -391,6 +397,7 @@ cmd_new() {
 }
 
 cmd_say() {
+	if generated "${1:-}"; then die "${1:-} is generated -- it is written by a program, and a model editing what reports the truth is a dashboard that lies"; fi
 	[ $# -ge 2 ] || die "usage: pitch say <name> <what to change>"
 	name=$1; shift; want=$*
 	dir=$(site_dir "$name")
@@ -467,6 +474,7 @@ cmd_say() {
 # collapse into a single commit. The artifact does not move -- what you signed
 # off is byte for byte what ships -- so there is nothing to re-check.
 cmd_land() {
+	if generated "${1:-}"; then die "${1:-} is generated -- there is nothing to land"; fi
 	[ $# -eq 1 ] || die "usage: pitch land <name>"
 	name=$1
 	dir=$(site_dir "$name")
@@ -530,6 +538,7 @@ cmd_land() {
 # Throw the whole run of tweaks away and go back to the last landed version.
 # `back` undoes one change; this undoes everything since the last landing.
 cmd_drop() {
+	if generated "${1:-}"; then die "${1:-} is generated -- there is nothing to drop"; fi
 	[ $# -eq 1 ] || die "usage: pitch drop <name>"
 	name=$1
 	dir=$(site_dir "$name")
@@ -545,6 +554,7 @@ cmd_drop() {
 }
 
 cmd_back() {
+	if generated "${1:-}"; then die "${1:-} is generated -- rerun the program that writes it"; fi
 	[ $# -eq 1 ] || die "usage: pitch back <name>"
 	dir=$(site_dir "$1")
 	[ -d "$dir/.git" ] || die "there is no site called $1"
@@ -582,6 +592,7 @@ cmd_ls() {
 }
 
 cmd_open() {
+	if generated "${1:-}"; then die "${1:-} is generated -- it names this machine, its gateways and every site, and is never published"; fi
 	[ $# -eq 1 ] || die "usage: pitch open <name>"
 	dir=$(site_dir "$1")
 	[ -d "$dir" ] || die "there is no site called $1"
@@ -649,6 +660,14 @@ reconcile() {
 			"$ts" serve --bg --https "$port" --set-path "$path" "$proxy" >/dev/null
 		fi
 	done
+}
+
+# What reconcile would change, without changing it. ward is read-only by
+# construction, so it needs a way to ask about drift that cannot cause any.
+drift() {
+	want=$(desired)
+	have=$(current)
+	printf '%s\n%s\n' "$want" "$have" | sort | uniq -u | grep . || true
 }
 
 # A build should not fail because the tailnet is asleep. The page is proven
@@ -894,6 +913,8 @@ up) cmd_up "$@" ;;
 down) cmd_down "$@" ;;
 reconcile) reconcile ;;
 desired) desired ;;
+drift) drift ;;
+ward) exec "$BIN/ward" ;;
 group) cmd_group "$@" ;;
 doctor) cmd_doctor "$@" ;;
 -h | --help | help) usage ;;

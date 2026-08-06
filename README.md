@@ -76,6 +76,21 @@ Then, for the phone, `hail`'s setup applies unchanged — the BotFather token,
 privacy mode off, one group per app. Make a group called `pitch`, add the bot,
 and describe an app in it. It answers twice: once now, once with the URL.
 
+## Watching it
+
+    https://mars.tailnet.ts.net/ward/
+
+`ward` reads what every part already writes down -- message verdicts, build
+verdicts, locks, the serve config, the containers -- and renders one page. It
+answers *liveness, not presence*: every failure this system has had was a
+component that was up and not working. heed executing code that had been
+replaced. matterbridge up and not fetching for two hours. A build working a
+directory that no longer existed. So each line is how long since that thing
+last did what it exists to do.
+
+It reports and cannot act. There is no restart button, because a dashboard
+with one is a remote shell with a nicer font.
+
 ## Reading order
 
 `DESIGN.md`. It is the requirements, the procedure and the definition of done,

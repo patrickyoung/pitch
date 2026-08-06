@@ -53,14 +53,15 @@ ls:
 group name:
     ./bin/pitch group {{name}}
 
-# two launchd jobs: the server, and the reconcile that notices a site the
-# container built. Both are needed once the phone is in the loop -- the Mac
-# cannot watch the mount, so it asks the tree instead, once a minute.
+# three launchd jobs: the server; the reconcile that notices a site the
+# container built; and ward, which only ever reads. Reconcile acts on the world
+# and ward observes it, so they are separate jobs at separate cadences -- that
+# split is what makes "the observer cannot act" a fact rather than a promise.
 install:
     #!/bin/sh
     set -eu
     mkdir -p "$HOME/Library/LaunchAgents" log
-    for j in com.bench.pitch com.bench.pitch-reconcile; do
+    for j in com.bench.pitch com.bench.pitch-reconcile com.bench.pitch-ward; do
         sed "s|@ROOT@|$PWD|g; s|@HOME@|$HOME|g" "launchd/$j.plist" \
             >"$HOME/Library/LaunchAgents/$j.plist"
         launchctl unload "$HOME/Library/LaunchAgents/$j.plist" 2>/dev/null || true

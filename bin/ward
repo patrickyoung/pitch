@@ -1,0 +1,213 @@
+#!/bin/sh
+# ward -- keep watch, and write down what is true.
+#
+# It reads what every part of this system already writes down and renders it as
+# one page. It cannot act: no restart, no deploy, no retry, no change to a
+# site's source or to the serve configuration. A dashboard with a button is a
+# remote shell with a nicer font, reachable by anything on the tailnet, and
+# observing and acting are different systems -- only one of them is safe to
+# leave open in a browser tab.
+#
+# It writes exactly two things: its own page under sites/ward, and one cache
+# file in state/ holding the word "ok" or "fail" from the Telegram probe, so
+# that probe runs once a minute rather than once a tick. Nothing else, ever.
+#
+# The question it answers is not "what is running". Everything that broke here
+# was running: heed executing code that had been replaced, matterbridge up and
+# not fetching for two hours, a ply working a directory that no longer existed,
+# pitch-serve dead while tailscale advertised five paths to it. So every line
+# is a liveness, not a presence -- how long since it last did the thing it
+# exists to do.
+set -eu
+
+prog=$0
+while [ -L "$prog" ]; do
+	dir=$(dirname -- "$prog")
+	link=$(readlink -- "$prog")
+	case $link in
+	/*) prog=$link ;;
+	*) prog=$dir/$link ;;
+	esac
+done
+BIN=$(CDPATH= cd -- "$(dirname -- "$prog")" && pwd)
+. "$BIN/../lib/common.sh"
+SELF=$(CDPATH= cd -- "$BIN/.." && pwd)
+ROOT=${PITCH_ROOT:-$SELF}
+load_config
+
+OUT=$ROOT/sites/ward
+mkdir -p "$OUT" "$ROOT/state"
+NOW=$(date -u +%s)
+
+# An ISO8601 stamp into seconds, without caring whose date(1) this is. macOS
+# wants -j -f and GNU wants -d, and this project has already paid once for
+# assuming which. python3 is in the image and on the Mac and answers the same.
+epoch() {
+	python3 - "$1" <<'PY' 2>/dev/null || echo 0
+import sys, datetime
+s = sys.argv[1].split('.')[0].rstrip('Z')
+try:
+    print(int(datetime.datetime.fromisoformat(s).replace(tzinfo=datetime.timezone.utc).timestamp()))
+except ValueError:
+    print(0)
+PY
+}
+
+COMPS='[]'
+# add NAME STATE NOTE [SINCE-EPOCH] -- state is ok | stale | down | busy
+add() {
+	COMPS=$(printf '%s' "$COMPS" | jq -c \
+		--arg n "$1" --arg s "$2" --arg note "$3" --arg since "${4:-}" \
+		'. + [{name:$n, state:$s, note:$note,
+		       since:(if $since == "" then null else ($since|tonumber) end)}]')
+}
+
+dockerq() { command -v docker >/dev/null 2>&1 && docker "$@" 2>/dev/null || true; }
+
+# ------------------------------------------------------------- pitch-serve
+# Asked at the port, not at a pid file: launchd writes no pid file of ours, and
+# the port is the thing that can only have one owner.
+if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:$PITCH_PORT/" 2>/dev/null; then
+	was=$(cat "$ROOT/.serve.stamp" 2>/dev/null || true)
+	is=$(mtime "$BIN/pitch-serve")
+	if [ -n "$was" ] && [ "$was" != "$is" ]; then
+		add pitch-serve stale "running code older than bin/pitch-serve"
+	else
+		add pitch-serve ok "127.0.0.1:$PITCH_PORT"
+	fi
+else
+	add pitch-serve down "nothing is serving 127.0.0.1:$PITCH_PORT"
+fi
+
+# -------------------------------------------------------------------- heed
+# The staleness that cost an afternoon: the tree is mounted so an edit takes
+# effect on the next message, which is true of handlers and false of heed --
+# one long-running shell that parsed itself once.
+HROOT=${HAIL_ROOT:-$HOME/projects/hail}
+if [ -n "$(dockerq ps -q --filter name=^shop-heed$)" ]; then
+	started=$(dockerq inspect -f '{{.State.StartedAt}}' shop-heed)
+	sat=$(epoch "${started:-}")
+	code=$(mtime "$HROOT/bin/heed" 2>/dev/null || echo 0)
+	if [ "$sat" -gt 0 ] && [ "$code" -gt "$sat" ]; then
+		add heed stale "running code from before $HROOT/bin/heed last changed" "$sat"
+	else
+		add heed ok "listening" "$sat"
+	fi
+elif pgrep -x heed >/dev/null 2>&1; then
+	add heed ok "listening, natively"
+else
+	add heed down "no listener, so no chat reaches a handler"
+fi
+
+# ------------------------------------------------------------ matterbridge
+# A container being up says nothing: this one ran for two hours after its
+# Telegram poll died, logging nothing. The only honest probe is asking Telegram
+# a question it can answer, and getChat does not disturb the long poll that
+# getUpdates holds.
+PROBE=$ROOT/state/ward.telegram
+if [ -n "$(dockerq ps -q --filter name=^shop-matterbridge$)" ] || pgrep -x matterbridge >/dev/null 2>&1; then
+	last=$(cat "$PROBE.at" 2>/dev/null || echo 0)
+	case $last in '' | *[!0-9]*) last=0 ;; esac
+	if [ $((NOW - last)) -ge "${PITCH_WARD_PROBE:-60}" ]; then
+		conf=${MATTERBRIDGE_CONFIG:-$HOME/.config/matterbridge/matterbridge.toml}
+		tok=$(sed -n 's/^ *Token *= *"\(.*\)".*/\1/p' "$conf" 2>/dev/null | head -1)
+		chat=$(sed -n 's/^channel = "\(-[0-9]*\)".*/\1/p' "$conf" 2>/dev/null | head -1)
+		# Only the verdict is written down. The token never leaves this line.
+		if [ -n "$tok" ] && [ -n "$chat" ] &&
+			curl -fsS --max-time 8 "https://api.telegram.org/bot$tok/getChat?chat_id=$chat" 2>/dev/null |
+			jq -e '.ok == true' >/dev/null 2>&1; then
+			printf 'ok' >"$PROBE"
+		else
+			printf 'fail' >"$PROBE"
+		fi
+		printf '%s' "$NOW" >"$PROBE.at"
+		last=$NOW
+	fi
+	if [ "$(cat "$PROBE" 2>/dev/null || echo)" = ok ]; then
+		add matterbridge ok "reached Telegram" "$last"
+	else
+		add matterbridge down "up, but cannot reach Telegram -- this is the deaf failure" "$last"
+	fi
+else
+	add matterbridge down "not running, so nothing arrives from any chat"
+fi
+
+# --------------------------------------------------------------- tailscale
+if host=$(tailnet_host 2>/dev/null) && [ -n "$host" ]; then
+	n=$("$BIN/pitch" desired 2>/dev/null | grep -c . || true)
+	d=$("$BIN/pitch" drift 2>/dev/null | grep -c . || true)
+	if [ "${d:-0}" -gt 0 ]; then
+		add tailscale stale "$d path(s) differ from the tree -- pitch reconcile"
+	else
+		add tailscale ok "${n:-0} path(s), matching the tree"
+	fi
+else
+	host=${PITCH_HOST:-}
+	add tailscale down "no tailnet, so every URL is loopback"
+fi
+
+# ------------------------------------------------------------------ builds
+# A lock with no work behind it is the orphan that ran for 23 hours.
+BUILDS='[]'
+for l in "$ROOT"/state/*.lock; do
+	[ -d "$l" ] || continue
+	nm=${l##*/}; nm=${nm%.lock}
+	at=$(cat "$l/at" 2>/dev/null || echo 0)
+	case $at in '' | *[!0-9]*) at=0 ;; esac
+	BUILDS=$(printf '%s' "$BUILDS" | jq -c --arg n "$nm" --arg a "$at" \
+		'. + [{name:$n, since:($a|tonumber)}]')
+done
+nb=$(printf '%s' "$BUILDS" | jq -r 'length')
+if [ "$nb" -gt 0 ]; then
+	add builds busy "$nb in flight"
+else
+	add builds ok "nothing building"
+fi
+
+# ------------------------------------------------------------------- sites
+SITES='[]'
+if [ -d "$ROOT/sites" ]; then
+	for d in "$ROOT"/sites/*; do
+		[ -d "$d" ] || continue
+		nm=${d##*/}
+		valid_name "$nm" || continue
+		ch=$(git -C "$d" log -1 --format=%ct 2>/dev/null || echo 0)
+		subj=$(git -C "$d" log -1 --format=%s 2>/dev/null | cut -c1-60 || true)
+		verdict=$(cat "$ROOT/log/$nm"/*.jsonl 2>/dev/null | tail -1 | jq -r '.verdict // ""' 2>/dev/null || true)
+		if [ -f "$d/.public" ]; then vis=public; else vis=private; fi
+		[ -f "$d/.generated" ] && vis=generated
+		SITES=$(printf '%s' "$SITES" | jq -c --arg n "$nm" --arg c "$ch" --arg s "$subj" \
+			--arg v "$verdict" --arg vis "$vis" \
+			'. + [{name:$n, changed:($c|tonumber), subject:$s, verdict:$v, visibility:$vis}]')
+	done
+fi
+
+# ------------------------------------------------------------------ recent
+# Two append-only logs, already carrying verdicts, merged newest last. Nothing
+# is computed here that was not already written down by whoever did the work.
+day=$(date -u +%F)
+RECENT=$(
+	{
+		cat "$HROOT/log/$day.jsonl" 2>/dev/null | jq -c 'select(.dir=="in") |
+			{t:(.received_at // ""), who:(.gateway // "?"), kind:(if (.Extra.file // []) | length > 0 then "photo" else "message" end),
+			 text:((.text // (.Extra.file[0].Comment // ""))[0:60]), verdict:(.heed.reason // "")}' 2>/dev/null
+		cat "$ROOT"/log/*/"$day".jsonl 2>/dev/null | jq -c '{t:(.t // ""), who:(.site // "?"), kind:"build",
+			 text:((.what // "")[0:60]), verdict:(.verdict // "")}' 2>/dev/null
+	} | jq -sc 'map(select(.t != "")) | sort_by(.t) | .[-14:]' 2>/dev/null
+)
+[ -n "$RECENT" ] || RECENT='[]'
+
+# ------------------------------------------------------------------- write
+# Through a temporary and a rename, so a reader never sees half a document.
+tmp=$OUT/.state.json.$$
+jq -n --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg now "$NOW" \
+	--arg host "${host:-}" --argjson comps "$COMPS" --argjson sites "$SITES" \
+	--argjson builds "$BUILDS" --argjson recent "$RECENT" \
+	'{at:$at, now:($now|tonumber), host:$host, components:$comps,
+	  sites:$sites, builds:$builds, recent:$recent}' >"$tmp"
+mv -f "$tmp" "$OUT/state.json"
+
+# The page itself is checked into the tree and never generated, so the thing
+# that reports the truth cannot be rewritten by anything that might be wrong.
+[ -f "$OUT/index.html" ] || cp "$SELF/etc/ward.html" "$OUT/index.html"
+: >"$OUT/.generated"

@@ -345,6 +345,51 @@ out=$(./bin/pitch drop counter 2>&1) && no "dropping with nothing to drop was al
 case $out in *"nothing to drop"*) ;; *) no "the refusal does not say why: $out" ;; esac
 verdict
 
+try "ward reports what is down as down, and can change nothing"
+# A dashboard that says ok when nothing is running is worse than no dashboard:
+# every failure this system has had was a component that was up and not
+# working, so the one thing ward may never do is flatter the machine.
+WARDCFG=$WORK/ward.env
+printf 'PITCH_PORT=%s\n' "$((20000 + $$ % 40000))" >"$WARDCFG"   # nothing listens there
+mkdir -p "$WORK/nostub"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/nostub/docker"
+chmod +x "$WORK/nostub/docker"
+before=$(find "$NEWROOT" -type f | sort | md5 2>/dev/null || find "$NEWROOT" -type f | sort | md5sum)
+PITCH_CONFIG=$WARDCFG PITCH_TAILSCALE=/nonexistent PATH="$WORK/nostub:$PATH" \
+	PITCH_ROOT=$NEWROOT ./bin/ward >/dev/null 2>&1 || no "ward exited nonzero with everything down"
+
+S=$NEWROOT/sites/ward/state.json
+[ -s "$S" ] || no "ward wrote no state"
+for c in pitch-serve tailscale; do
+	st=$(jq -r --arg c "$c" '.components[] | select(.name==$c) | .state' "$S" 2>/dev/null)
+	[ "$st" = down ] || no "$c is $st when nothing is running -- a dashboard may not flatter the machine"
+done
+jq -e '.components | length >= 4' "$S" >/dev/null 2>&1 || no "ward reported almost nothing"
+jq -e '.host != null and .now > 0' "$S" >/dev/null 2>&1 || no "ward wrote no timestamp to derive ages from"
+# The probe verdict is written down; the token never is.
+grep -rqi "$(sed -n 's/^ *Token *= *"\(.*\)".*/\1/p' "$WORK/mb3.toml" 2>/dev/null || echo ZZZUNLIKELY)" \
+	"$NEWROOT/sites/ward/" 2>/dev/null && no "a bot token reached the page"
+
+# It may write its own page and one probe cache, and nothing else at all.
+after=$(find "$NEWROOT" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' | sort | md5 2>/dev/null ||
+	find "$NEWROOT" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' | sort | md5sum)
+[ "$before" = "$after" ] || true   # file list, not contents: new files outside its own tree
+n=$(find "$NEWROOT" -newer "$WARDCFG" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' 2>/dev/null | wc -l | tr -d ' ')
+[ "$n" = 0 ] || no "ward wrote $n file(s) outside sites/ward: $(find "$NEWROOT" -newer "$WARDCFG" -type f -not -path '*/sites/ward/*' -not -name 'ward.telegram*' | head -2 | tr '\n' ' ')"
+verdict
+
+try "the page that reports the truth cannot be rewritten by a model, or published"
+[ -f "$NEWROOT/sites/ward/.generated" ] || no "ward left no marker, so nothing knows it is generated"
+for v in say land drop back open; do
+	case $v in
+	say) out=$(PITCH_ROOT=$NEWROOT ./bin/pitch say ward "redesign it" 2>&1) ;;
+	*) out=$(PITCH_ROOT=$NEWROOT ./bin/pitch "$v" ward 2>&1) ;;
+	esac
+	[ $? -eq 0 ] && no "pitch $v accepted a generated site"
+	case $out in *generated*) ;; *) no "pitch $v refused for the wrong reason: $out" ;; esac
+done
+verdict
+
 try "doctor asks the port, and knows a stale server from a launchd one"
 # A real server on a port of its own, because doctor asks the port rather than
 # a pid file: launchd writes no pid file of ours, and consulting one reported

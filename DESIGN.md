@@ -116,6 +116,19 @@ Both are TLS from Tailscale's own `*.ts.net` certificate. Default is private.
   does not reopen it.
 - **No RPC between container and host.** A file appearing is the event. A
   socket here would be a protocol, a version, and a thing to be down.
+- **No button on the dashboard, and no endpoint in the server.** `ward`
+  reports and cannot act: no restart, no deploy, no retry. A dashboard with a
+  button is a remote shell with a nicer font, reachable by anything on the
+  tailnet, and observing and acting are different systems. For the same reason
+  `pitch-serve` gains no computed endpoint -- it is eighty lines and provably
+  cannot be walked out of *because* it only reads files, and a static server
+  that shells out to `docker` is not a static server. The cost is that the
+  page can be stale, so it says how stale it is, which is the honest trade.
+- **No socket for the dashboard, and no metrics store.** The fastest thing
+  worth seeing is a build starting; nobody perceives better than two seconds,
+  so a WebSocket buys a property no human can detect and costs a live
+  connection to defend. The logs are the history and the page is a view of
+  them -- there is nothing to retain that is not already retained.
 - **No preview or staging URL.** The check is the preview. A page that passes
   is deployed and a page that fails never existed.
 - **No visibility or deploy verbs in the workshop group.** New things are
@@ -142,6 +155,7 @@ loop.
 | `.change` + the existing `index.html` -> the smallest edit that satisfies it | ply -check | the same loop and a **different goal**. Building and editing are not one job, and giving them one goal is why five requests produced five different apps |
 | answering a question about the app | ask -f, threaded | there is no check a program could apply to conversation, so `ply` would buy only latency |
 | learning from builds that failed and then passed | hone | not yet. See *Later, if earned* |
+| showing what is running, and what is only *up* | none -- a script | `ward`. Every component already writes its state down; this is a rendering problem, not an observation one, and a model in it would be guessing at facts that are on disk |
 
 ## Why there is a server
 

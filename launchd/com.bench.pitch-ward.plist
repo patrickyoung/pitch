@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.bench.pitch-ward - keep watch, every ten seconds.
+
+  A second job rather than a branch of the reconcile one, and the split is the
+  point: reconcile *acts* on the world and ward only *reads* it. Different
+  risks earn different cadences, and keeping them apart is what makes "the
+  observer cannot act" a fact about the program rather than a promise about
+  the code inside it.
+
+  Ten seconds because the fastest thing worth seeing is a build starting, and
+  the page derives its ages from timestamps -- so the numbers tick every
+  second between runs and the screen reads as live without a socket to defend.
+
+  Written by `just install`, which substitutes @ROOT@ and @HOME@.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bench.pitch-ward</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@ROOT@/bin/ward</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@ROOT@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:@HOME@/go/bin:@HOME@/.local/bin</string>
+    <key>PITCH_ROOT</key>
+    <string>@ROOT@</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>@ROOT@/log/ward.log</string>
+  <key>StandardErrorPath</key>
+  <string>@ROOT@/log/ward.log</string>
+</dict>
+</plist>
