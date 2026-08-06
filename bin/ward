@@ -158,10 +158,13 @@ for l in "$ROOT"/state/*.lock; do
 		'. + [{name:$n, since:($a|tonumber)}]')
 done
 nb=$(printf '%s' "$BUILDS" | jq -r 'length')
-if [ "$nb" -gt 0 ]; then
-	add builds busy "$nb in flight"
-else
+oldest=$(printf '%s' "$BUILDS" | jq -r 'if length == 0 then 0 else (map(.since) | min) end')
+if [ "$nb" -eq 0 ]; then
 	add builds ok "nothing building"
+elif [ "$oldest" -gt 0 ] && [ $((NOW - oldest)) -gt "${PITCH_BUILD_MAX:-1800}" ]; then
+	add builds stale "$nb in flight, and one has outlived any build" "$oldest"
+else
+	add builds busy "$nb in flight" "$oldest"
 fi
 
 # ------------------------------------------------------------------- sites

@@ -345,6 +345,35 @@ out=$(./bin/pitch drop counter 2>&1) && no "dropping with nothing to drop was al
 case $out in *"nothing to drop"*) ;; *) no "the refusal does not say why: $out" ;; esac
 verdict
 
+try "a build has a wall clock, and a stuck one is reported by name"
+# -cycles bounds the loop and -timeout bounds one command, and neither bounds
+# the run: a ply worked a deleted directory for 23 hours 47 minutes, calling a
+# model, and nothing noticed. The group matters as much as the clock -- killing
+# the shell leaves the interpreter running.
+t0=$(date +%s)
+st=0
+( . ./lib/common.sh
+  eval "$(sed -n '/^bounded() {/,/^}/p' ./bin/pitch)"
+  bounded 2 sh -c 'sleep 60 & sleep 60' ) >/dev/null 2>&1 || st=$?
+took=$(($(date +%s) - t0))
+[ "$took" -le 12 ] || no "a runaway ran for ${took}s past a 2s bound"
+[ "$st" != 0 ] || no "a killed build reported success"
+[ "$(pgrep -f 'sleep 60' | wc -l | tr -d ' ')" = 0 ] ||
+	no "the grandchild survived -- killing the shell left the interpreter running"
+
+# and doctor names it, rather than leaving it to be noticed a day later
+mkdir -p "$NEWROOT/state/wedged.lock"
+printf '%s\n' "$(( $(date -u +%s) - 99999 ))" >"$NEWROOT/state/wedged.lock/at"
+out=$(PITCH_ROOT=$NEWROOT ./bin/pitch doctor 2>&1 || true)
+case $out in
+*"outlived any build"*) ;;
+*) no "doctor said nothing about a build stuck for a day: $(printf '%s' "$out" | grep -i build)" ;;
+esac
+case $out in *wedged*) ;; *) no "doctor did not name the stuck build" ;; esac
+PITCH_ROOT=$NEWROOT ./bin/pitch doctor >/dev/null 2>&1 && no "doctor exited 0 with a build stuck"
+rm -rf "$NEWROOT/state/wedged.lock"
+verdict
+
 try "ward reports what is down as down, and can change nothing"
 # A dashboard that says ok when nothing is running is worse than no dashboard:
 # every failure this system has had was a component that was up and not

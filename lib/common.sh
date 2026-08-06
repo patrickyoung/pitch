@@ -43,12 +43,17 @@ load_config() {
 	: "${PITCH_SMALL_MODEL:=${PITCH_MODEL}}"  # slugs, specs, classification
 	: "${PITCH_CYCLES:=6}"           # failed checks before ply gives up
 	: "${PITCH_CMD_TIMEOUT:=120s}"   # per command ply runs
+	# A wall clock on the whole build. -cycles bounds the loop and
+	# -timeout bounds one command, and neither bounds the run: one ply
+	# worked a deleted directory for 23 hours 47 minutes, calling a model,
+	# and nothing noticed. Generous against a three-minute build.
+	: "${PITCH_BUILD_MAX:=1800}"
 	: "${PITCH_PAGE_TIMEOUT:=45}"    # seconds page-check gives one page
 	: "${PITCH_BUDGET:=512000}"      # bytes over the wire, same origin
 	: "${PITCH_TAILSCALE:=}"
 	export PITCH_PORT PITCH_HTTPS_PORT PITCH_FUNNEL_PORT PITCH_MODEL
 	export PITCH_SMALL_MODEL PITCH_CYCLES PITCH_CMD_TIMEOUT PITCH_PAGE_TIMEOUT
-	export PITCH_BUDGET
+	export PITCH_BUDGET PITCH_BUILD_MAX
 }
 
 # A site name becomes a path component, a URL path, a git repository, a

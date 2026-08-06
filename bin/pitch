@@ -193,6 +193,35 @@ staging_down() {
 	return 0
 }
 
+# Run something with a wall clock, in its own process group.
+#
+# The group is not decoration: killing the shell leaves the interpreter
+# running, which draft prove records paying for, and a build's children are a
+# server, a browser and a model client. `set -m` gives the job a group of its
+# own so one signal reaches all of it.
+#
+# `wait || st=$?` rather than toggling set -e around it. `set -e` inside a
+# function is global, so restoring it here would clobber the caller's -- the
+# third variant of that trap in this file.
+bounded() {
+	secs=$1
+	shift
+	set -m
+	"$@" &
+	pid=$!
+	set +m
+	( sleep "$secs"
+	  kill -TERM "-$pid" 2>/dev/null
+	  sleep 5
+	  kill -KILL "-$pid" 2>/dev/null ) >/dev/null 2>&1 &
+	dog=$!
+	st=0
+	wait "$pid" || st=$?
+	kill "$dog" 2>/dev/null || true
+	wait "$dog" 2>/dev/null || true
+	return "$st"
+}
+
 # The whole loop. ply drives until page-check exits 0 against the staging URL,
 # and page-check is a program, so exit 0 is its opinion and not the model's.
 #
@@ -231,7 +260,8 @@ work() {
 	mkdir -p "$ROOT/build/.scratch"
 	ASK_DIR=$ROOT/.ask \
 	TMPDIR=$ROOT/build/.scratch \
-	"${PLY:-ply}" -B \
+	bounded "$PITCH_BUILD_MAX" \
+		"${PLY:-ply}" -B \
 		-C "$ROOT/build/$name" \
 		-t "$ROOT/build/.tools" \
 		-s web-house \
@@ -423,7 +453,9 @@ cmd_say() {
 	printf '%s\n' "$want" >"$stage/.change"
 	spec_keep "$stage" "$name"
 
-	if work "$name" "$EDIT_GOAL"; then
+	st=0
+	work "$name" "$EDIT_GOAL" || st=$?
+	if [ "$st" = 0 ]; then
 		spec_restore "$stage" "$name"
 		rm -f "$stage/.change"
 		# The live tree is replaced only now, at the end, by a page that has
@@ -464,6 +496,9 @@ cmd_say() {
 	else
 		record "$name" fail "$want"
 		rm -rf "$stage"
+		if [ "$st" = 143 ] || [ "$st" = 137 ]; then
+			die "that build ran past $((PITCH_BUILD_MAX / 60)) minutes and was stopped, so $name is unchanged and still up."
+		fi
 		die "that change did not pass the check, so $name is unchanged and still up."
 	fi
 }
@@ -881,6 +916,21 @@ cmd_doctor() {
 	else
 		say no "nothing is serving 127.0.0.1:$PITCH_PORT -- pitch up, or: just install"
 	fi
+
+	stuck=
+	for l in "$ROOT"/state/*.lock; do
+		[ -d "$l" ] || continue
+		nm=${l##*/}; nm=${nm%.lock}
+		at=$(cat "$l/at" 2>/dev/null || echo 0)
+		case $at in '' | *[!0-9]*) at=0 ;; esac
+		age=$(($(date -u +%s) - at))
+		if [ "$age" -gt "$PITCH_BUILD_MAX" ]; then
+			stuck="$stuck $nm(${age}s)"
+		else
+			say ok "building $nm, ${age}s"
+		fi
+	done
+	[ -z "$stuck" ] || say no "a build has outlived any build:$stuck -- nothing is behind that lock"
 
 	gone=
 	while read -r t; do

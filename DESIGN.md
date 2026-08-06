@@ -428,6 +428,21 @@ the check, and each is a bug this design would otherwise have shipped.
   answer. **And `PITCH_HOST` must be set in the config**, or the container --
   which has no `tailscaled` to ask -- replies to a phone with
   `http://127.0.0.1:8787/...`.
+- **`-cycles` bounds the loop, `-timeout` bounds a command, and neither
+  bounds the run.** A `ply` worked a directory that no longer existed for 23
+  hours 47 minutes, calling a model the whole time, and nothing anywhere
+  noticed: no log line, no reply, no verdict. A build that never finishes is
+  silence, and silence looks exactly like not-started-yet. `PITCH_BUILD_MAX`
+  is a wall clock, and the run gets its own **process group** -- killing the
+  shell leaves the interpreter running, which `draft prove` records paying for,
+  and a build's children are a server, a browser and a model client. `doctor`
+  and `ward` both name a lock that has outlived any build.
+- **`set -e` inside a function is global.** `set +e; wait; st=$?; set -e`
+  restores it for the *caller* too, so a function that tidied up after itself
+  clobbered a `set +e` two frames up and the script exited on a status it was
+  deliberately ignoring. `wait "$pid" || st=$?` needs no toggle at all. Third
+  variant of this trap in this file, after the AND-list and the comment
+  between a command prefix and its command.
 - **A server that is up and running last week's rules looks exactly like a
   working one.** `SPEC.md` answered 404 through `pitch-serve` and 200 through
   the real tailnet URL, and the difference was a process started before the
