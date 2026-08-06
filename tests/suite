@@ -89,6 +89,15 @@ for f in bin/pitch bin/pitch-serve bin/page-check bin/pitch-chat bin/check tests
 done
 python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1],"rb"))' \
 	etc/gateway.toml.example 2>/dev/null || no "etc/gateway.toml.example is not TOML"
+# An unknown argument is an error, and -h is not. Nothing tested either, so
+# flipping one comparison made *every* unrecognised flag print usage and exit
+# 0 -- a silent success in the one place a wrong flag should be loudest.
+./bin/pitch-serve -h >/dev/null 2>&1 || no "pitch-serve -h does not exit 0"
+case $(./bin/pitch-serve -h 2>&1) in *usage:*) ;; *) no "pitch-serve -h prints no usage" ;; esac
+./bin/page-check -h >/dev/null 2>&1 || no "page-check -h does not exit 0"
+if ./bin/pitch-serve --nonsense >/dev/null 2>&1; then
+	no "pitch-serve accepted an unknown argument and exited 0"
+fi
 verdict
 
 # ------------------------------------------------- 2. the name is hostile
