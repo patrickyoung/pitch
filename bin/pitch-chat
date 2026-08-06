@@ -106,6 +106,40 @@ converse() {
 	say "$out"
 }
 
+# Pictures become words, once, here at the edge.
+#
+# ply drives a model with programs, not attachments, so an image can never be
+# carried into a build. It is described at the moment it arrives and the
+# description is what SPEC.md and .change carry -- which means every later edit
+# inherits the visual intent instead of the picture being dragged through every
+# cycle. It also means the toolbox needs no tool for looking at images, which
+# removes one rather than adding one.
+describe() {
+	[ -n "${HAIL_FILES:-}" ] && [ -d "$HAIL_FILES" ] || return 0
+	set --
+	for f in "$HAIL_FILES"/*; do
+		[ -e "$f" ] || continue
+		set -- "$@" -a "$f"
+	done
+	[ $# -gt 0 ] || return 0
+	printf '%s' "$msg" | "$ASK" -n -q ${HAIL_MODEL:+-m "$HAIL_MODEL"} "$@" \
+		'Describe the attached image or images as a brief for somebody
+		building a web page who cannot see them: layout, colour, type,
+		spacing, mood, and any words that appear in them. What was asked
+		for alongside them is on stdin. Output the description and nothing
+		else.' 2>/dev/null
+}
+
+# The message, with anything the pictures showed folded into it.
+withpictures() {
+	shown=$(describe)
+	if [ -n "$shown" ]; then
+		printf '%s\n\nThe reference image shows: %s\n' "$msg" "$shown"
+	else
+		printf '%s\n' "$msg"
+	fi
+}
+
 # One cheap call to decide what a message wants. A model deciding what a
 # sentence means is judgment; it is never asked whether something is allowed,
 # because every verb below is one the group already owns.
@@ -138,11 +172,12 @@ if [ "$SITE" = "pitch" ]; then
 	new)
 		say "on it. Naming it and building it now -- a few minutes."
 		(
-			if ! name=$(pitch slug "$msg" 2>&1); then
+			want=$(withpictures)
+			if ! name=$(pitch slug "$want" 2>&1); then
 				printf 'could not name that one:\n%s\n' "$name" | hail pitch
 				exit 0
 			fi
-			if url=$(pitch new "$name" "$msg" 2>&1 | tail -1); then
+			if url=$(pitch new "$name" "$want" 2>&1 | tail -1); then
 				printf '%s\n\nits group is "%s". Make that Telegram group, add the bot, send anything in it, then run:\npitch group %s\n' \
 					"$url" "$name" "$name" | hail pitch
 			else
@@ -168,8 +203,8 @@ fi
 dir=$ROOT/sites/$SITE
 [ -d "$dir" ] || { say "there is no site called $SITE yet."; exit 0; }
 
-case $(classify 'The message on stdin is about a web app somebody owns. Answer
-	with one word and nothing else:
+case $(classify 'The message on stdin is about a web app somebody owns.
+	Answer with one word and nothing else:
 
 	change   they want the app to be different
 	ask      they are asking a question about it
@@ -188,7 +223,7 @@ drop) say "$(pitch drop "$SITE" 2>&1 || true)" ;;
 change)
 	say "on it. Building and checking that -- a few minutes."
 	(
-		if out=$(pitch say "$SITE" "$msg" 2>&1); then
+		if out=$(pitch say "$SITE" "$(withpictures)" 2>&1); then
 			# Two lines: how much of the file moved, and the URL. The first is
 			# the gauge -- "346 of 371 lines changed" is a rewrite wearing the
 			# app's name, and saying so is the only warning available.
@@ -222,6 +257,13 @@ change)
 	# changes in, the agent was answering questions about a version it had never
 	# seen. The stamp lives beside the thread, because it is a fact about this
 	# conversation and not about the app.
+	if [ -n "${HAIL_FILES:-}" ] && [ -d "$HAIL_FILES" ]; then
+		for f in "$HAIL_FILES"/*; do
+			[ -e "$f" ] || continue
+			set -- "$@" -a "$f"
+		done
+	fi
+
 	is=$(mtime "$dir/index.html" 2>/dev/null || echo 0)
 	if [ ! -s "${HAIL_THREAD:-/dev/null}" ] || [ "$(cat "$seen" 2>/dev/null || true)" != "$is" ]; then
 		set -- "$@" -a "$dir/index.html"

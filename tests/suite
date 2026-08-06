@@ -548,6 +548,44 @@ achat 'a third question, after an edit'
 [ "$(attached)" -ge 1 ] || no "the source changed and was not re-attached -- the agent is answering about a version it has never seen"
 verdict
 
+try "a picture becomes words in the spec, and never rides into a build"
+# ply drives a model with programs, not attachments, so an image cannot be
+# carried into a build at all. It is described once when it arrives and the
+# description is what the commit and the spec carry -- which every later edit
+# then inherits.
+IMGDIR=$WORK/pics
+mkdir -p "$IMGDIR"
+printf 'not really a png\n' >"$IMGDIR/1.png"
+: >"$STUB_LOG"
+head0=$(git -C "$NEWROOT/sites/counter" rev-parse HEAD)
+printf 'make it look like this\n' | PITCH_ROOT=$NEWROOT HAIL_GATEWAY=counter \
+	HAIL_THREAD=$WORK/pic.jsonl HAIL_FILES=$IMGDIR ASK=$ROOT/tests/ask-stub \
+	PLY=$ROOT/tests/ply-stub PITCH_TAILSCALE=$ROOT/tests/tailscale-stub \
+	STUB_VERB=change ./bin/pitch-chat >/dev/null 2>&1
+n=0
+while [ "$(git -C "$NEWROOT/sites/counter" rev-parse HEAD)" = "$head0" ]; do
+	n=$((n + 1)); [ "$n" -gt 300 ] && break
+	sleep 0.1
+done
+body=$(git -C "$NEWROOT/sites/counter" log -1 --format=%B)
+case $body in
+*"mint green"*) ;;
+*) no "what the picture showed never reached the change: $(printf '%s' "$body" | tr '\n' ' ' | cut -c1-90)" ;;
+esac
+case $body in
+*"make it look like this"*) ;;
+*) no "the words that came with the picture were lost" ;;
+esac
+grep -q -- "-a $IMGDIR/1.png" "$STUB_LOG" || no "the image was never shown to a model"
+# Both stubs write to one log and ask's lines start with "ask ". So the picture
+# reaching ply is exactly a non-ask line carrying -a, and there must be none:
+# ply has no way to look at an image, and a build that was handed one would be
+# carrying it through every cycle for nothing.
+if grep -v '^ask ' "$STUB_LOG" | grep -q -- ' -a '; then
+	no "the picture was carried into ply, which cannot look at it"
+fi
+verdict
+
 try "pitch group picks the group named after the site, never a private chat"
 # The chat-id filter had no case at all: the suite avoids live getUpdates, and
 # that avoidance had a cost -- break the title preference and `pitch group

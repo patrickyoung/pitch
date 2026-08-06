@@ -12,7 +12,12 @@ want=$(cat 2>/dev/null || true)
 printf '%s\n' "ask $*" >>"${STUB_LOG:-/dev/null}"
 
 case " $* " in
-*"Answer with one word"*)
+*"Describe the attached image"*)
+	# A picture becomes words exactly once, at the edge. Nothing downstream
+	# ever sees the image, so this is the whole of the conversion.
+	printf '%s\n' "${STUB_SHOWN:-a wall of mint green with one round button}"
+	;;
+*"one word and nothing else"*)
 	# Both classifiers ask this. $STUB_VERB is what they get back, and the
 	# default is the harmless one -- the same default the real thing falls
 	# back to when the call fails.
