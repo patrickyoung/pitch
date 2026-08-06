@@ -577,11 +577,23 @@ case $body in
 *) no "the words that came with the picture were lost" ;;
 esac
 grep -q -- "-a $IMGDIR/1.png" "$STUB_LOG" || no "the image was never shown to a model"
-# Both stubs write to one log and ask's lines start with "ask ". So the picture
-# reaching ply is exactly a non-ask line carrying -a, and there must be none:
-# ply has no way to look at an image, and a build that was handed one would be
-# carrying it through every cycle for nothing.
-if grep -v '^ask ' "$STUB_LOG" | grep -q -- ' -a '; then
+
+# Asking *about* a picture is not the same path as building *from* one, and
+# only the second was wired: the workshop answered "I don't see an attached
+# picture" about a picture that had arrived and was sitting on disk.
+for gw in pitch counter; do
+	: >"$STUB_LOG"
+	printf 'what do you see here?\n' | PITCH_ROOT=$NEWROOT HAIL_GATEWAY=$gw \
+		HAIL_THREAD=$WORK/q-$gw.jsonl HAIL_FILES=$IMGDIR ASK=$ROOT/tests/ask-stub \
+		STUB_VERB=ask ./bin/pitch-chat >/dev/null 2>&1
+	grep -q -- "-a $IMGDIR/1.png" "$STUB_LOG" ||
+		no "a question in the $gw group did not carry the picture"
+done
+# Both stubs write one line per call to the same log, tagged with their own
+# name. The picture reaching ply is exactly a ply line carrying -a, and there
+# must be none: ply has no way to look at an image, and a build handed one
+# would be carrying it through every cycle for nothing.
+if grep '^ply ' "$STUB_LOG" | grep -q -- ' -a '; then
 	no "the picture was carried into ply, which cannot look at it"
 fi
 verdict

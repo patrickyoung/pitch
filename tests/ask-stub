@@ -9,7 +9,10 @@ set -eu
 [ "${1:-}" = "system" ] && { printf 'you are a stub\n'; exit 0; }
 
 want=$(cat 2>/dev/null || true)
-printf '%s\n' "ask $*" >>"${STUB_LOG:-/dev/null}"
+# One line per call. Prompts are multi-line, so logging "$*" raw makes a single
+# call span many lines and every `grep -v '^ask '` in the suite then reads a
+# continuation line as if it came from somewhere else.
+printf 'ask %s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >>"${STUB_LOG:-/dev/null}"
 
 case " $* " in
 *"Describe the attached image"*)

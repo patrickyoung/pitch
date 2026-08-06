@@ -192,6 +192,16 @@ if [ "$SITE" = "pitch" ]; then
 		set -- -q -f "$HAIL_THREAD" \
 			-S "$("$ASK" system; brief cat hail-house 2>/dev/null; cat "$SELF/README.md" 2>/dev/null)"
 		[ -n "${HAIL_MODEL:-}" ] && set -- "$@" -m "$HAIL_MODEL"
+		# Pictures ride along here too. Building from one already worked --
+		# `new` runs them through describe -- but *asking* about one in this
+		# group did not, so the reply was "I don't see an attached picture"
+		# about a picture that had arrived and was sitting on disk.
+		if [ -n "${HAIL_FILES:-}" ] && [ -d "$HAIL_FILES" ]; then
+			for f in "$HAIL_FILES"/*; do
+				[ -e "$f" ] || continue
+				set -- "$@" -a "$f"
+			done
+		fi
 		converse "$@"
 		;;
 	esac

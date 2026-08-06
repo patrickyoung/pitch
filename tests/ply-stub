@@ -10,7 +10,9 @@
 # chat message must never arrive here as an argument.
 set -eu
 
-printf '%s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+# One line per call -- the goal is multi-line, and a call that spans lines
+# makes every line-oriented assertion in the suite unreliable.
+printf 'ply %s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >>"${STUB_LOG:-/dev/null}"
 
 dir=. check= before=no
 # Captured before the loop eats it. The goal is the last argument and the loop
