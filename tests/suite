@@ -134,7 +134,15 @@ for u in "/plain/SPEC.md" "/plain/.public" "/plain/.isolate" "/plain/.domain"; d
 	[ "$c" = 404 ] || no "$u answered $c -- a public site would hand out what was asked for"
 done
 [ "$(code "http://127.0.0.1:$PORT/plain/")" = 200 ] || no "the app itself stopped being served"
+# .well-known is the one dotted path the web owns, and the exception for it was
+# unconstrained: draft prove flipped the comparison that grants it and no case
+# noticed. A rule nothing holds to account is a rule that could be backwards.
+mkdir -p "$SERVE_ROOT/plain/.well-known"
+printf 'ok\n' >"$SERVE_ROOT/plain/.well-known/x.txt"
+[ "$(code "http://127.0.0.1:$PORT/plain/.well-known/x.txt")" = 200 ] ||
+	no ".well-known is not reachable, and the web expects it to be"
 rm -f "$SERVE_ROOT/plain/SPEC.md" "$SERVE_ROOT/plain/.public"
+rm -rf "$SERVE_ROOT/plain/.well-known"
 verdict
 
 try "pitch-serve cannot be walked out of a site"
@@ -501,6 +509,66 @@ fi
 verdict
 
 # ------------------------------------ 17. untrusted text is never a word
+
+try "the app's source is attached when it has changed, and not otherwise"
+# "Once, at the start" was wrong: the app is edited between turns, so three
+# changes in the agent was answering about a version it had never seen. The fix
+# had no case, and draft prove found exactly that -- flipping the comparison
+# inverted it and all 25 cases stayed green.
+TH=$WORK/att.jsonl
+ATT=$NEWROOT/sites/counter/index.html
+achat() { printf '%s\n' "$1" | PITCH_ROOT=$NEWROOT HAIL_GATEWAY=counter \
+	HAIL_THREAD=$TH ASK=$ROOT/tests/ask-stub STUB_VERB=ask \
+	./bin/pitch-chat >/dev/null 2>&1; }
+# `grep -c` prints 0 and *exits 1* when it matches nothing, so `|| echo 0`
+# prints the count twice and every comparison after it is a bad number.
+attached() { grep -c -- "-a $ATT" "$STUB_LOG" 2>/dev/null || true; }
+
+: >"$TH"; rm -f "${TH%.jsonl}.attached"; : >"$STUB_LOG"
+achat 'the first question'
+[ "$(attached)" -ge 1 ] || no "the source was not attached when the conversation started"
+
+printf '{"role":"user"}\n' >"$TH"          # the thread is no longer empty
+: >"$STUB_LOG"
+achat 'a second question, nothing has changed'
+[ "$(attached)" -eq 0 ] || no "the source was attached again although it had not changed"
+
+touch "$ATT"
+: >"$STUB_LOG"
+achat 'a third question, after an edit'
+[ "$(attached)" -ge 1 ] || no "the source changed and was not re-attached -- the agent is answering about a version it has never seen"
+verdict
+
+try "pitch group picks the group named after the site, never a private chat"
+# The chat-id filter had no case at all: the suite avoids live getUpdates, and
+# that avoidance had a cost -- break the title preference and `pitch group
+# clock` silently wires the gateway to whichever group is first in the queue.
+mkdir -p "$WORK/stub" "$WORK/handlers"
+cat >"$WORK/stub/curl" <<'CURL'
+#!/bin/sh
+cat <<'JSON'
+{"result":[
+ {"message":{"chat":{"id":-100111,"type":"private","title":"counter"}}},
+ {"message":{"chat":{"id":-100222,"type":"group","title":"other"}}},
+ {"message":{"chat":{"id":-100333,"type":"supergroup","title":"counter"}}}
+]}
+JSON
+CURL
+# No bridge, so the guard does not fire and the filter is what is measured.
+printf '#!/bin/sh\nexit 0\n' >"$WORK/stub/docker"
+chmod +x "$WORK/stub/curl" "$WORK/stub/docker"
+MB3=$WORK/mb3.toml
+printf '[telegram.tg]\nToken = "123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"\n' >"$MB3"
+PATH="$WORK/stub:$PATH" MATTERBRIDGE_CONFIG=$MB3 HAIL_ROOT=$WORK \
+	./bin/pitch group counter >/dev/null 2>&1 || no "group failed on a fixture queue"
+got=$(sed -n '/^name = "counter"/,/^$/p' "$MB3" | sed -n 's/^channel = "\(-[0-9]*\)".*/\1/p' | head -1)
+case $got in
+-100333) ;;
+-100111) no "it wired the gateway to a private chat" ;;
+-100222) no "it ignored the title and took the first group in the queue" ;;
+*) no "it wired the gateway to \"$got\"" ;;
+esac
+verdict
 
 try "a chat message reaches ply through a file, never in argv"
 : >"$STUB_LOG"
