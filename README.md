@@ -69,7 +69,7 @@ only while the machine is: the tailnet is the host.
     just link                  # pitch onto ~/.local/bin
     pitch doctor               # mounts, tools, chromium, tailnet, the port
     tailscale up               # until this, every URL is loopback
-    just check                 # 21 cases, offline
+    just check                 # 30 cases, offline
     pitch up
 
 Then, for the phone, `hail`'s setup applies unchanged — the BotFather token,
