@@ -40,6 +40,27 @@
   .busy { color: var(--warn); }
   .age2 { color: var(--dim); font-variant-numeric: tabular-nums; }
   a { color: inherit; }
+  .hint { color: var(--dim); }
+  #sites tr { cursor: pointer; }
+  #sites tr.sel td:first-child { text-decoration: underline; }
+  .panel { border: 1px solid var(--rule); padding: .2rem 1rem .9rem; margin-top: .8rem; }
+  .panel .bar { display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; align-items: baseline; }
+  .panel .bar .x { margin-left: auto; cursor: pointer; color: var(--dim); }
+  .gauge { color: var(--warn); letter-spacing: -.08em; }
+  pre { margin: .3rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+  details > summary { cursor: pointer; color: var(--dim); }
+  form { display: flex; gap: .6rem; margin-top: .3rem; }
+  input[type=text] {
+    flex: 1; min-width: 8ch; font: inherit; color: inherit;
+    background: transparent; border: 1px solid var(--rule); border-radius: .4rem;
+    padding: .35rem .6rem;
+  }
+  button {
+    font: inherit; color: inherit; background: transparent;
+    border: 1px solid var(--rule); border-radius: .4rem; padding: .35rem .9rem;
+    cursor: pointer;
+  }
+  button:disabled { color: var(--dim); cursor: default; }
   footer { margin-top: 2rem; color: var(--dim); border-top: 1px solid var(--rule); padding-top: .6rem; }
   @media (prefers-reduced-motion: no-preference) { .live { transition: opacity .2s; } }
 </style>
@@ -53,20 +74,59 @@
   <div id="body" hidden>
     <div class="scroll"><table id="components"></table></div>
 
-    <h2>sites</h2>
+    <h2>sites <span class="hint">— click one to drill in</span></h2>
     <div class="scroll"><table id="sites"></table></div>
+
+    <div id="detail" class="panel" hidden>
+      <div class="bar">
+        <h2 id="dname">—</h2>
+        <a id="dlink" target="_blank" rel="noopener">open</a>
+        <span id="dmeta" class="hint"></span>
+        <span class="x" id="dclose">× close</span>
+      </div>
+
+      <h2>evolution <span class="hint">— lines of index.html each change moved</span></h2>
+      <div class="scroll"><table id="dhist"></table></div>
+
+      <h2>spec</h2>
+      <details id="dspecbox"><summary>what was agreed</summary><pre id="dspec"></pre></details>
+
+      <h2>activity</h2>
+      <div class="scroll"><table id="dact"></table></div>
+
+      <h2>capabilities</h2>
+      <p id="dagent" class="hint" style="margin:.2rem 0"></p>
+
+      <h2>ask</h2>
+      <form id="ask">
+        <input type="text" id="question" autocomplete="off"
+               placeholder="why did the spec change? what does the last commit touch?">
+        <button id="go" type="submit">ask</button>
+      </form>
+      <p class="hint" style="margin:.4rem 0 0">
+        answered by a model through pitch-agent, grounded only in what this
+        page already shows plus the app's own code; spends against ward's
+        budget, tailnet only.
+      </p>
+      <pre id="danswer"></pre>
+    </div>
 
     <h2>tokens today</h2>
     <div class="scroll"><table id="tokens"></table></div>
 
     <h2>recent</h2>
     <div class="scroll"><table id="recent"></table></div>
+
+    <h2 id="bullh">bulletins</h2>
+    <div id="bulletins"></div>
   </div>
 
   <p id="problem" class="down" hidden></p>
 
   <footer>
     read-only. ward reports; it cannot restart, deploy or change anything.
+    Asking is reading too: the answer is drawn from evidence on this page,
+    and changes nothing.
   </footer>
 </main>
 <script type="module">
@@ -74,7 +134,7 @@
   // generator. So the numbers tick every second between polls, and a page that
   // has gone stale says so rather than looking fresh and lying.
   const $ = id => document.getElementById(id);
-  let state = null, fetchedAt = 0;
+  let state = null, fetchedAt = 0, selected = null;
 
   const ago = secs => {
     if (!isFinite(secs) || secs < 0) return '—';
@@ -102,7 +162,6 @@
     if (!state) return;
     // Wall-clock drift between this browser and the machine is measured once
     // per poll and subtracted, so an age is an age and not a timezone bug.
-    const skew = (Date.now() / 1000) - (state.now + (Date.now() / 1000 - fetchedAt));
     const since = t => (t ? (Date.now() / 1000 - fetchedAt) + (state.now - t) : NaN);
 
     $('host').textContent = state.host || 'loopback only';
@@ -115,13 +174,20 @@
       [c.note, 'wrap'],
     ]));
 
-    rows($('sites'), state.sites.map(s => [
+    const sites = state.sites || [];
+    rows($('sites'), sites.map(s => [
       [s.name, 'name'],
       [s.visibility, s.visibility === 'public' ? 'stale' : ''],
       [s.changed ? ago(since(s.changed)) : '—', 'age2'],
       [s.verdict, s.verdict === 'fail' ? 'down' : 'ok'],
       [s.subject, 'wrap'],
     ]));
+    [...$('sites').rows].forEach((tr, i) => {
+      tr.dataset.name = sites[i].name;
+      tr.classList.toggle('sel', sites[i].name === selected);
+    });
+
+    renderDetail(since);
 
     // Intl rather than a hand-rolled comma splitter: the platform already
     // knows how this reader writes a number. Tokens, never money -- prices
@@ -155,8 +221,115 @@
       [r.text, 'wrap'],
     ]));
 
+    // The crier's bulletins: today's open, the rest folded behind their
+    // dates. The text is a chat message and renders as one -- textContent
+    // into a pre, never markup, same rule as everything else here.
+    const bulls = state.bulletins || [];
+    $('bullh').hidden = bulls.length === 0;
+    $('bulletins').hidden = bulls.length === 0;
+    $('bulletins').replaceChildren(...bulls.map((b, i) => {
+      const box = document.createElement(i ? 'details' : 'div');
+      const head = document.createElement(i ? 'summary' : 'p');
+      head.className = 'hint';
+      head.style.margin = '.2rem 0';
+      head.textContent =
+        `${new Date(b.t * 1000).toISOString().slice(0, 10)} · ${b.worker}/${b.job}`;
+      const pre = document.createElement('pre');
+      pre.textContent = b.text;
+      box.append(head, pre);
+      return box;
+    }));
+
     $('body').hidden = false;
   }
+
+  // The drill-down: one site's whole story, from fields ward already wrote.
+  // Nothing here fetches anything new except the answer to a question.
+  function renderDetail(since) {
+    const s = (state.sites || []).find(x => x.name === selected);
+    if (!s) { $('detail').hidden = true; return; }
+
+    $('dname').textContent = s.name;
+    $('dlink').href = `/${s.name}/`;
+    $('dmeta').textContent =
+      `${s.visibility} · last change ${s.changed ? ago(since(s.changed)) + ' ago' : 'never'}`;
+
+    // The gauge, drawn to the largest change in view: a long bar on a short
+    // request is a rewrite wearing the app's name, and seeing that shape
+    // across the history is the whole point of the panel.
+    const hist = s.history || [];
+    const top = Math.max(1, ...hist.map(h => h.moved));
+    rows($('dhist'), hist.map(h => [
+      [new Date(h.t * 1000).toISOString().slice(0, 10), 'age2'],
+      [String(h.moved), 'age2'],
+      ['█'.repeat(h.moved ? Math.max(1, Math.round(12 * h.moved / top)) : 0), 'gauge'],
+      [h.subject, 'wrap'],
+    ]));
+    if (!hist.length) rows($('dhist'), [[['no history — not committed yet', 'wrap']]]);
+
+    $('dspec').textContent = s.spec || 'no SPEC.md';
+
+    rows($('dact'), (s.activity || []).slice().reverse().map(a => [
+      [(a.t || '').slice(5, 16).replace('T', ' '), 'age2'],
+      [a.kind, ''],
+      [a.verdict, a.verdict === 'pass' || a.verdict === 'run' ? 'ok' : (a.verdict ? 'stale' : '')],
+      [a.what, 'wrap'],
+    ]));
+    if (!(s.activity || []).length) rows($('dact'), [[['nothing yet today', 'wrap']]]);
+
+    const caps = s.caps || [];
+    $('dagent').textContent = caps.length
+      ? `${caps.join(', ')} — last call ${s.agent_last ? ago(since(s.agent_last)) + ' ago' : 'never'}`
+      : 'none';
+
+    $('detail').hidden = false;
+  }
+
+  $('sites').addEventListener('click', ev => {
+    const tr = ev.target.closest('tr');
+    if (!tr || !tr.dataset.name) return;
+    selected = tr.dataset.name === selected ? null : tr.dataset.name;
+    $('danswer').textContent = '';
+    $('question').value = '';
+    render();
+  });
+  $('dclose').addEventListener('click', () => { selected = null; render(); });
+
+  // The question goes to pitch-agent as data, with every piece of evidence
+  // this page can gather: what ward wrote down, plus the app's own code from
+  // pitch-serve -- same origin, same bytes the site serves. The manifest
+  // decides what the model is told; this page only carries the envelope.
+  $('ask').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const s = (state?.sites || []).find(x => x.name === selected);
+    const q = $('question').value.trim();
+    if (!s || !q) return;
+    const out = $('danswer');
+    $('go').disabled = true;
+    out.textContent = 'thinking…';
+    try {
+      let code = '';
+      try {
+        const r = await fetch(`/${s.name}/index.html`, { cache: 'no-store' });
+        if (r.ok) code = await r.text();
+      } catch { /* a site with no page is still a site with a history */ }
+      const r = await fetch('agent/explain', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: s.name, question: q, spec: s.spec || '', code,
+          history: s.history || [], activity: s.activity || [], caps: s.caps || [],
+        }),
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) throw new Error(j?.error || `the agent answered ${r.status}`);
+      out.textContent = j.answer ?? JSON.stringify(j);
+    } catch (e) {
+      out.textContent = `no answer: ${e.message} — the agent is reachable through the tailnet, and only while pitch-agent is up.`;
+    } finally {
+      $('go').disabled = false;
+    }
+  });
 
   async function poll() {
     try {

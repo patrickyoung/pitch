@@ -504,6 +504,16 @@ jq -e '[.tokens[].in] | add < 999999' "$S" >/dev/null 2>&1 ||
 # and the second run must not re-read what has not moved
 [ -s "$NEWROOT/state/ward.tokens.json" ] || no "no token cache, so every tick re-reads every transcript"
 
+# The crier's bulletins reach the page from clerk's done spool, read-only:
+# ward asks nothing to publish, it reads what was already written.
+CFIX=$WORK/clerkfix
+mkdir -p "$CFIX/workers/crier/spool/done/bulletin-20260101"
+printf 'Yesterday was quiet.\n' >"$CFIX/workers/crier/spool/done/bulletin-20260101/BULLETIN.md"
+PITCH_CONFIG=$WARDCFG PITCH_TAILSCALE=/nonexistent PATH="$WORK/nostub:$PATH" \
+	CLERK_ROOT=$CFIX PITCH_ROOT=$NEWROOT ./bin/ward >/dev/null 2>&1
+jq -e '.bulletins[0].worker == "crier" and (.bulletins[0].text | startswith("Yesterday"))' \
+	"$S" >/dev/null 2>&1 || no "the bulletin did not reach state.json"
+
 # Its page, its two caches under state/ward.*, and nothing else anywhere. The
 # marker is taken after the fixtures, so only what ward itself writes is in
 # scope -- an earlier version blamed it for files the test had just created.
@@ -520,6 +530,22 @@ jq -e '.host != null and .now > 0' "$S" >/dev/null 2>&1 || no "ward wrote no tim
 # The probe verdict is written down; the token never is.
 grep -rqi "$(sed -n 's/^ *Token *= *"\(.*\)".*/\1/p' "$WORK/mb3.toml" 2>/dev/null || echo ZZZUNLIKELY)" \
 	"$NEWROOT/sites/ward/" 2>/dev/null && no "a bot token reached the page"
+
+# The drill-down: each site carries its own story -- the git history with
+# the moved-lines gauge, the spec, and an activity list -- so the page can
+# show how an app is evolving without asking anything new to be recorded.
+jq -e '.sites[] | select(.name=="counter")
+	| ((.history | length) >= 1) and ((.spec | length) > 0)
+	  and ((.activity | type) == "array") and ((.history[0] | has("moved")))' \
+	"$S" >/dev/null 2>&1 || no "state.json carries no drill-down for counter"
+
+# The page's one question is a manifest pitch-agent interprets -- data, not
+# a program -- and a manifest that requires nothing cannot fail honestly.
+M=$NEWROOT/sites/ward/agent/explain
+[ -f "$M" ] || no "ward installed no explain manifest"
+grep -q '^requires: *answer' "$M" 2>/dev/null || no "the explain manifest names no required key"
+awk '/^prompt:/ { p = 1; next } p && NF { ok = 1 } END { exit !ok }' "$M" 2>/dev/null ||
+	no "the explain manifest has no prompt"
 
 verdict
 

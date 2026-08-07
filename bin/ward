@@ -8,12 +8,14 @@
 # observing and acting are different systems -- only one of them is safe to
 # leave open in a browser tab.
 #
-# It writes its own page under sites/ward, and two caches under state/ward.*:
+# It writes its own site under sites/ward -- the page, state.json, and the
+# agent/explain manifest through which the page may ask one model question
+# about a site, as data, via pitch-agent -- and two caches under state/ward.*:
 # the word "ok" or "fail" from the Telegram probe, so that probe runs once a
 # minute rather than once a tick, and a token tally keyed by mtime so a
-# transcript that has not moved is not read again. Both are derived and can be
-# deleted at any time. Nothing else, anywhere, ever -- and a case fails if that
-# stops being true, which is how this comment stays honest.
+# transcript that has not moved is not read again. All of it is derived and can
+# be deleted at any time. Nothing else, anywhere, ever -- and a case fails if
+# that stops being true, which is how this comment stays honest.
 #
 # The question it answers is not "what is running". Everything that broke here
 # was running: heed executing code that had been replaced, matterbridge up and
@@ -41,6 +43,7 @@ load_config
 OUT=$ROOT/sites/ward
 mkdir -p "$OUT" "$ROOT/state"
 NOW=$(date -u +%s)
+day=$(date -u +%F)
 
 # An ISO8601 stamp into seconds, without caring whose date(1) this is. macOS
 # wants -j -f and GNU wants -d, and this project has already paid once for
@@ -247,6 +250,49 @@ TOKENS=$(printf '%s' "$TOK" | jq -c 'to_entries | map({name:.key, in:.value.i, o
 	| sort_by(-(.in + .out))')
 
 # ------------------------------------------------------------------- sites
+# One object per site, carrying enough of its story to drill into: the git
+# history with the moved-lines gauge per commit -- how much of index.html
+# each change actually moved, which is the number that tells an edit from a
+# rewrite -- the spec, the recent builds and chat, and what its runtime
+# capabilities have been up to. Every field is read from what the system
+# already writes down; nothing new is recorded anywhere.
+
+# The history, newest first. The header line is marked with a literal "C"
+# because a numstat line also starts with digits, and a hex escape in the
+# marker would be a bet on which awk this is.
+history_of() {
+	git -C "$1" log -20 --format='C%x09%ct%x09%s' --numstat 2>/dev/null |
+	awk -F'\t' '
+		function flush() { if (ct != "") printf "%s\t%s\t%s\n", ct, moved, subj }
+		$1 == "C" && NF >= 3 {
+			flush(); ct = $2; subj = $3
+			for (i = 4; i <= NF; i++) subj = subj "\t" $i
+			moved = 0; next
+		}
+		NF == 3 && $3 == "index.html" { moved += $1 + $2 }
+		END { flush() }
+	' |
+	jq -Rsc '[split("\n")[] | select(length > 0) | split("\t") |
+		{t: (.[0] | tonumber), moved: (.[1] | tonumber),
+		 subject: (.[2:] | join("\t"))[0:80]}]' 2>/dev/null || printf '[]'
+}
+
+# Builds from this site's own log, chat from hail's, merged oldest first.
+# The dated glob, not *.jsonl: build-*.jsonl files in the same directory are
+# ply sessions, and the last line of one is an ask event with no verdict.
+activity_of() {
+	{
+		cat "$ROOT/log/$1"/[0-9]*-*.jsonl 2>/dev/null | tail -40 |
+			jq -c 'select(.t) | {t, kind: "build", verdict: (.verdict // ""),
+				what: ((.what // "")[0:100])}' 2>/dev/null
+		cat "$HROOT/log/$day.jsonl" 2>/dev/null |
+			jq -c --arg n "$1" 'select((.dir // "") == "in" and (.gateway // "") == $n) |
+				{t: (.received_at // ""), verdict: (.heed.reason // ""),
+				 kind: (if ((.Extra.file // []) | length) > 0 then "photo" else "chat" end),
+				 what: ((.text // (.Extra.file[0].Comment // ""))[0:100])}' 2>/dev/null
+	} | jq -sc 'map(select(.t != "")) | sort_by(.t) | .[-20:]' 2>/dev/null || printf '[]'
+}
+
 SITES='[]'
 if [ -d "$ROOT/sites" ]; then
 	for d in "$ROOT"/sites/*; do
@@ -255,19 +301,40 @@ if [ -d "$ROOT/sites" ]; then
 		valid_name "$nm" || continue
 		ch=$(git -C "$d" log -1 --format=%ct 2>/dev/null || echo 0)
 		subj=$(git -C "$d" log -1 --format=%s 2>/dev/null | cut -c1-60 || true)
-		verdict=$(cat "$ROOT/log/$nm"/*.jsonl 2>/dev/null | tail -1 | jq -r '.verdict // ""' 2>/dev/null || true)
+		# The dated glob here too -- *.jsonl read a build transcript's last
+		# line as the verdict and the column had been silently empty.
+		verdict=$(cat "$ROOT/log/$nm"/[0-9]*-*.jsonl 2>/dev/null | tail -1 | jq -r '.verdict // ""' 2>/dev/null || true)
 		if [ -f "$d/.public" ]; then vis=public; else vis=private; fi
 		[ -f "$d/.generated" ] && vis=generated
+		spec=$(cat "$d/SPEC.md" 2>/dev/null || true)
+		hist=$(history_of "$d")
+		act=$(activity_of "$nm")
+		caps='[]'
+		agent_last=0
+		if [ -d "$d/agent" ]; then
+			# `|| continue`, never `&& printf`: under set -e a trailing
+			# AND-list whose test fails is a failed command at statement
+			# level -- the same shape that bit lock() in bin/pitch.
+			caps=$(for c in "$d/agent"/*; do [ -f "$c" ] || continue; printf '%s\n' "${c##*/}"; done |
+				jq -R . 2>/dev/null | jq -sc . 2>/dev/null || printf '[]')
+			for f in "$ROOT/log/$nm/agent"/*.jsonl; do
+				[ -f "$f" ] || continue
+				m=$(mtime "$f" 2>/dev/null || echo 0)
+				if [ "$m" -gt "$agent_last" ]; then agent_last=$m; fi
+			done
+		fi
 		SITES=$(printf '%s' "$SITES" | jq -c --arg n "$nm" --arg c "$ch" --arg s "$subj" \
-			--arg v "$verdict" --arg vis "$vis" \
-			'. + [{name:$n, changed:($c|tonumber), subject:$s, verdict:$v, visibility:$vis}]')
+			--arg v "$verdict" --arg vis "$vis" --arg spec "$spec" --arg al "$agent_last" \
+			--argjson hist "$hist" --argjson act "$act" --argjson caps "$caps" \
+			'. + [{name:$n, changed:($c|tonumber), subject:$s, verdict:$v, visibility:$vis,
+			       spec:$spec, history:$hist, activity:$act, caps:$caps,
+			       agent_last:($al|tonumber)}]')
 	done
 fi
 
 # ------------------------------------------------------------------ recent
 # Two append-only logs, already carrying verdicts, merged newest last. Nothing
 # is computed here that was not already written down by whoever did the work.
-day=$(date -u +%F)
 RECENT=$(
 	{
 		cat "$HROOT/log/$day.jsonl" 2>/dev/null | jq -c 'select(.dir=="in") |
@@ -279,17 +346,67 @@ RECENT=$(
 )
 [ -n "$RECENT" ] || RECENT='[]'
 
+# --------------------------------------------------------------- bulletins
+# The crier's bulletins, newest first, straight from clerk's done spool.
+# ward reads what other systems already write down; nothing is asked to
+# publish, and a machine with no clerk tree simply has no bulletins. Seven
+# at most: a bulletin is bounded to one chat message by its own check, so
+# the cap bounds the page, not the prose.
+BULLS='[]'
+CROOT=${CLERK_ROOT:-$HOME/projects/clerk}
+if [ -d "$CROOT/workers" ]; then
+	for b in "$CROOT"/workers/*/spool/done/bulletin-*/BULLETIN.md; do
+		[ -f "$b" ] || continue
+		bjd=${b%/BULLETIN.md}
+		bid=${bjd##*/}
+		bw=${bjd%/spool/done/*}
+		bw=${bw##*/}
+		bm=$(mtime "$b" 2>/dev/null || echo 0)
+		BULLS=$(printf '%s' "$BULLS" | jq -c --arg w "$bw" --arg j "$bid" \
+			--arg m "$bm" --arg tx "$(cat "$b")" \
+			'. + [{t:($m|tonumber), worker:$w, job:$j, text:$tx}]')
+	done
+	BULLS=$(printf '%s' "$BULLS" | jq -c 'sort_by(-.t) | .[0:7]')
+fi
+
 # ------------------------------------------------------------------- write
 # Through a temporary and a rename, so a reader never sees half a document.
 tmp=$OUT/.state.json.$$
 jq -n --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg now "$NOW" \
 	--arg host "${host:-}" --argjson comps "$COMPS" --argjson sites "$SITES" \
 	--argjson builds "$BUILDS" --argjson recent "$RECENT" --argjson tokens "$TOKENS" \
+	--argjson bulls "$BULLS" \
 	'{at:$at, now:($now|tonumber), host:$host, components:$comps,
-	  sites:$sites, builds:$builds, recent:$recent, tokens:$tokens}' >"$tmp"
+	  sites:$sites, builds:$builds, recent:$recent, tokens:$tokens,
+	  bulletins:$bulls}' >"$tmp"
 mv -f "$tmp" "$OUT/state.json"
 
 # The page itself is checked into the tree and never generated, so the thing
 # that reports the truth cannot be rewritten by anything that might be wrong.
-[ -f "$OUT/index.html" ] || cp "$SELF/etc/ward.html" "$OUT/index.html"
+# Synced, not copied-if-missing: etc/ward.html is the source of truth, so an
+# upgraded page reaches the site on the next tick, and a page anything else
+# rewrote is healed rather than trusted. Temporary and rename, as always.
+if ! cmp -s "$SELF/etc/ward.html" "$OUT/index.html" 2>/dev/null; then
+	tmp=$OUT/.index.html.$$
+	cp "$SELF/etc/ward.html" "$tmp" && mv -f "$tmp" "$OUT/index.html"
+fi
+
+# The one question the page may ask a model, installed as a manifest for
+# pitch-agent to interpret -- data, not a program, so ward still cannot
+# act. The source is checked into etc/; the config's small model is pinned
+# on the front when there is one, because pitch-agent's environment is not
+# the shell you tested in. Through a temporary and a rename, and only when
+# the content changed, so a reader never sees half a manifest and an
+# unchanged tick writes nothing.
+mkdir -p "$OUT/agent"
+tmp=$OUT/agent/.explain.$$
+{
+	if [ -n "${PITCH_SMALL_MODEL:-}" ]; then printf 'model: %s\n' "$PITCH_SMALL_MODEL"; fi
+	cat "$SELF/etc/ward-explain"
+} >"$tmp" 2>/dev/null || : >"$tmp"
+if cmp -s "$tmp" "$OUT/agent/explain" 2>/dev/null; then
+	rm -f "$tmp"
+else
+	mv -f "$tmp" "$OUT/agent/explain"
+fi
 : >"$OUT/.generated"
