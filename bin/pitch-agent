@@ -1,0 +1,271 @@
+#!/usr/bin/env node
+// pitch-agent -- the one thing a page may ask for that it cannot compute.
+//
+//   POST /vibecanvas/agent/vibe   ->  sites/vibecanvas/agent/vibe
+//
+// The capability name is the file's name: inetd a third time, after the
+// gateway and the site. Adding one is adding a file, and nothing here has a
+// routes table.
+//
+// The file is a **manifest, not a program**. That is the whole security story.
+// The builder writes these, and a model-written script behind a URL is a
+// different risk class from a model-written page: builds run in a container
+// precisely so model-authored code is boxed, and a serving endpoint is not.
+// So the model is handed data and this program interprets it, which means a
+// capability can cause exactly one thing -- an ask call with a prompt and a
+// list of keys its answer must have.
+//
+// It is a separate program from pitch-serve on purpose. That server is eighty
+// lines and provably cannot be walked out of *because* it only reads files;
+// giving it exec would trade a checkable property for a promise. Two programs,
+// two risks, one origin as far as the browser is concerned.
+//
+// Private only, and mechanically so: pitch adds the /agent path to the 443
+// handler and never to the funnelled 8443 one, and refuses to open a site that
+// has capabilities. An unauthenticated model endpoint on the public internet
+// is somebody else spending your tokens.
+
+import { spawn, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import os from 'node:os';
+
+const HERE = path.dirname(path.dirname(fs.realpathSync(new URL(import.meta.url).pathname)));
+
+const argv = process.argv.slice(2);
+const opt = {
+  port: Number(process.env.PITCH_AGENT_PORT || 8788),
+  root: process.env.PITCH_SITES || path.join(process.env.PITCH_ROOT || HERE, 'sites'),
+  logs: path.join(process.env.PITCH_ROOT || HERE, 'log'),
+  ask: process.env.ASK || 'ask',
+};
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '-p') opt.port = Number(argv[++i]);
+  else if (argv[i] === '-r') opt.root = argv[++i];
+  else if (argv[i] === '-h' || argv[i] === '--help') {
+    process.stdout.write('usage: pitch-agent [-p port] [-r sites-dir]\n');
+    process.exit(0);
+  } else { process.stderr.write(`pitch-agent: unknown argument ${argv[i]}\n`); process.exit(2); }
+}
+
+// The same rule as every other program here. A name is a path component and a
+// program's name, and validating it in some places is how this becomes a
+// remote shell. lib/common.sh holds the shell copy; case 2 runs both.
+const NAME = /^[a-z][a-z0-9-]{0,30}[a-z0-9]$|^[a-z]$/;
+
+const BODY_MAX = Number(process.env.PITCH_AGENT_BODY_MAX || 6_000_000);
+const IMAGE_MAX = Number(process.env.PITCH_AGENT_IMAGE_MAX || 4_000_000);
+const CALL_TIMEOUT = Number(process.env.PITCH_AGENT_TIMEOUT || 60) * 1000;
+const IMAGE_TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
+
+const send = (res, code, obj) => {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+  });
+  res.end(body);
+};
+
+// A manifest: `key: value` lines, then `prompt:` and everything after it.
+// Deliberately not TOML or YAML -- there is nothing here worth a parser, and a
+// format with no nesting cannot express anything this program will not read.
+function manifest(file) {
+  const text = fs.readFileSync(file, 'utf8');
+  const cut = text.search(/^prompt:[ \t]*$/m);
+  const head = cut === -1 ? text : text.slice(0, cut);
+  const m = { prompt: cut === -1 ? '' : text.slice(text.indexOf('\n', cut) + 1).trim() };
+  for (const line of head.split('\n')) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const i = line.indexOf(':');
+    if (i > 0) m[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return m;
+}
+
+// What this site's *runtime* calls have spent today, from the sessions ask
+// itself writes. One place for the truth: ward reads the same files to draw
+// the meter, so the cap and the number on the dashboard cannot disagree.
+//
+// Only agent sessions, which is why they live in their own directory. The
+// first live call refused because a build had spent 69,025 tokens that morning
+// -- and building an app must not switch off the app's own features. Two kinds
+// of spending, two budgets, and only one of them is the page's to blow.
+function spentToday(site) {
+  const dir = path.join(opt.logs, site, 'agent');
+  const midnight = Math.floor(Date.now() / 1000 / 86400) * 86400;
+  let total = 0;
+  let files = [];
+  try { files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')); } catch { return 0; }
+  for (const f of files) {
+    const p = path.join(dir, f);
+    let st; try { st = fs.statSync(p); } catch { continue; }
+    if (st.mtimeMs / 1000 < midnight) continue;
+    let text; try { text = fs.readFileSync(p, 'utf8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line.includes('"usage"')) continue;
+      try {
+        const u = JSON.parse(line)?.data?.usage;
+        if (u) total += (u.in || 0) + (u.out || 0);
+      } catch { /* a half-written line is not a reason to refuse a request */ }
+    }
+  }
+  return total;
+}
+
+// The system prompt, composed the way every other caller in this family
+// composes it: ask's own default, then the site's skill through brief. `ask`
+// has no -s -- that is ply's flag -- so the skill is text here, and the same
+// skill is what the builder read and what the chat agent picks up as .domain.
+// One place says what good work looks like; three readers.
+function systemFor(skill) {
+  let base = '';
+  try { base = execFileSync(opt.ask, ['system'], { encoding: 'utf8' }); } catch { /* ask says nothing */ }
+  if (!skill) return base;
+  try {
+    return base + '\n' + execFileSync('brief', ['cat', skill], { encoding: 'utf8' });
+  } catch {
+    // A capability naming a skill that is not on BRIEF_PATH would otherwise
+    // work and quietly answer without its doctrine, which is worse than a 500.
+    throw new Error(`no skill "${skill}" on BRIEF_PATH`);
+  }
+}
+
+// One ask call. The body goes on **stdin**; it is never an argument, so a
+// request beginning with `-` cannot become a flag and nothing re-parses it.
+function askOnce(m, stdinText, imageFile, sessionDir) {
+  return new Promise(resolve => {
+    const args = ['-n', '-q', '-d', sessionDir, '-S', m.system];
+    if (m.model) args.push('-m', m.model);
+    if (imageFile) args.push('-a', imageFile);
+    args.push(m.prompt);
+
+    const kid = spawn(opt.ask, args, {
+      env: { ...process.env, ASK_DIR: sessionDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let out = '', err = '';
+    const timer = setTimeout(() => { try { kid.kill('SIGKILL'); } catch {} }, CALL_TIMEOUT);
+    kid.stdout.on('data', d => { out += d; });
+    kid.stderr.on('data', d => { err += d; if (err.length > 4096) err = err.slice(-4096); });
+    kid.on('error', e => { clearTimeout(timer); resolve({ code: 127, out: '', err: e.message }); });
+    kid.on('close', code => { clearTimeout(timer); resolve({ code, out, err }); });
+    kid.stdin.end(stdinText);
+  });
+}
+
+// A model returning prose where the page expects an object is a broken app, so
+// the answer is checked before it reaches a browser. `requires` is a list of
+// keys, not a schema language: calling it JSON Schema when it is a word list
+// would be a lie, and a word list is what this actually needs.
+function validate(text, requires) {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end <= start) return { ok: false, why: 'the answer was not JSON' };
+  let value;
+  try { value = JSON.parse(text.slice(start, end + 1)); } catch (e) { return { ok: false, why: e.message }; }
+  const missing = (requires || []).filter(k => !(k in value));
+  if (missing.length) return { ok: false, why: `missing ${missing.join(', ')}` };
+  return { ok: true, value };
+}
+
+const readBody = req => new Promise((resolve, reject) => {
+  let n = 0; const chunks = [];
+  req.on('data', c => {
+    n += c.length;
+    if (n > BODY_MAX) { reject(new Error(`body over ${BODY_MAX} bytes`)); req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => resolve(Buffer.concat(chunks)));
+  req.on('error', reject);
+});
+
+const server = http.createServer(async (req, res) => {
+  if (req.method !== 'POST') return send(res, 405, { error: 'only POST' });
+
+  const parts = decodeURIComponent(req.url.split(/[?#]/, 1)[0]).split('/').filter(Boolean);
+  // /<site>/agent/<capability>
+  if (parts.length !== 3 || parts[1] !== 'agent') return send(res, 404, { error: 'not found' });
+  const [site, , cap] = parts;
+  if (!NAME.test(site) || !NAME.test(cap)) return send(res, 403, { error: 'forbidden' });
+
+  const file = path.join(opt.root, site, 'agent', cap);
+  let real;
+  try { real = fs.realpathSync(file); } catch { return send(res, 404, { error: `no capability ${cap}` }); }
+  const base = fs.realpathSync(path.join(opt.root, site, 'agent'));
+  if (!real.startsWith(base + path.sep)) return send(res, 403, { error: 'forbidden' });
+
+  let m;
+  try { m = manifest(real); } catch (e) { return send(res, 500, { error: e.message }); }
+  const requires = (m.requires || '').split(/[\s,]+/).filter(Boolean);
+  // A capability with nothing to check is a capability that cannot fail
+  // honestly, which is worse than one that does not exist.
+  if (!requires.length) return send(res, 500, { error: `${cap} names no required keys` });
+  if (!m.prompt) return send(res, 500, { error: `${cap} has no prompt` });
+  try { m.system = systemFor(m.skill); } catch (e) { return send(res, 500, { error: e.message }); }
+
+  const budget = Number(m.budget || 0);
+  if (budget > 0) {
+    const spent = spentToday(site);
+    if (spent >= budget) {
+      return send(res, 429, {
+        error: `${site} has spent ${spent} tokens today, and its budget is ${budget}`,
+        spent, budget,
+      });
+    }
+  }
+
+  let body;
+  try { body = await readBody(req); } catch (e) { return send(res, 413, { error: e.message }); }
+
+  let input;
+  try { input = JSON.parse(body.toString('utf8') || '{}'); } catch { return send(res, 400, { error: 'body is not JSON' }); }
+
+  // An image arrives as a data URL, written to a temp file and passed with -a.
+  // ask decides what a file is by reading it, so nothing here has to be told a
+  // .png is an image. heed solved this same spooling once already, for chat.
+  let imageFile = null;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pitch-agent-'));
+  try {
+    if (typeof input.image === 'string' && input.image.startsWith('data:')) {
+      const mm = /^data:([^;,]+);base64,(.*)$/s.exec(input.image);
+      if (!mm) return send(res, 400, { error: 'image must be a base64 data URL' });
+      const ext = IMAGE_TYPES[mm[1]];
+      if (!ext) return send(res, 415, { error: `${mm[1]} is not an image this accepts` });
+      const bytes = Buffer.from(mm[2], 'base64');
+      if (bytes.length > IMAGE_MAX) {
+        return send(res, 413, { error: `image is ${bytes.length} bytes, over the ${IMAGE_MAX} limit` });
+      }
+      imageFile = path.join(dir, `in.${ext}`);
+      fs.writeFileSync(imageFile, bytes);
+    }
+    delete input.image;                       // the rest is what the model reads
+
+    const sessions = path.join(opt.logs, site, 'agent');
+    fs.mkdirSync(sessions, { recursive: true });
+    const stdin = JSON.stringify(input);
+
+    let r = await askOnce(m, stdin, imageFile, sessions);
+    let v = r.code === 0 ? validate(r.out, requires) : { ok: false, why: r.err.trim() || `ask exited ${r.code}` };
+    if (!v.ok) {
+      // One retry, then an error the page can show. A person is waiting, so
+      // this is ply's loop bounded to something a human will sit through.
+      r = await askOnce(m, stdin, imageFile, sessions);
+      v = r.code === 0 ? validate(r.out, requires) : { ok: false, why: r.err.trim() || `ask exited ${r.code}` };
+    }
+    if (!v.ok) return send(res, 502, { error: v.why });
+    return send(res, 200, v.value);
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// Loopback only. What reaches this from the tailnet is decided by tailscale,
+// and only on the private port -- see the note at the top.
+server.listen(opt.port, '127.0.0.1', () => {
+  process.stderr.write(`pitch-agent: ${opt.root} on http://127.0.0.1:${server.address().port}\n`);
+  if (process.env.PITCH_AGENT_PORT_FILE) fs.writeFileSync(process.env.PITCH_AGENT_PORT_FILE, String(server.address().port));
+});
+server.on('error', e => { process.stderr.write(`pitch-agent: ${e.message}\n`); process.exit(2); });

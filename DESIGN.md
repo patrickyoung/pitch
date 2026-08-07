@@ -116,6 +116,23 @@ Both are TLS from Tailscale's own `*.ts.net` certificate. Default is private.
   does not reopen it.
 - **No RPC between container and host.** A file appearing is the event. A
   socket here would be a protocol, a version, and a thing to be down.
+- **No capability that is a program.** The builder writes these, and a
+  model-written script behind a URL is a different risk class from a
+  model-written page: builds run in a container precisely so model-authored
+  code is boxed, and a serving endpoint is not. So a capability is a
+  *manifest* -- a skill, a model, a budget, a list of keys the answer must
+  carry, a prompt -- and one hand-written interpreter reads it. A capability
+  can cause exactly one thing: an `ask` call. The blast radius is a prompt.
+- **No public capability, and it is not a promise.** `AllowFunnel` is keyed by
+  port, so the agent path is added to the 443 handler and to nothing else, and
+  `pitch open` refuses a site that has an `agent/` directory. An
+  unauthenticated model endpoint on the public internet is somebody else
+  spending your tokens; pitch has refused accounts and refuses to grow them,
+  so a site with capabilities stays on the tailnet.
+- **No exec in `pitch-serve`.** The interpreter is a second program on a
+  second port, one origin behind tailscale. The static server is eighty lines
+  and provably cannot be walked out of *because* it only reads files, and
+  giving it exec would trade a checkable property for a promise.
 - **No button on the dashboard, and no endpoint in the server.** `ward`
   reports and cannot act: no restart, no deploy, no retry. A dashboard with a
   button is a remote shell with a nicer font, reachable by anything on the
@@ -155,6 +172,7 @@ loop.
 | `.change` + the existing `index.html` -> the smallest edit that satisfies it | ply -check | the same loop and a **different goal**. Building and editing are not one job, and giving them one goal is why five requests produced five different apps |
 | answering a question about the app | ask -f, threaded | there is no check a program could apply to conversation, so `ply` would buy only latency |
 | learning from builds that failed and then passed | hone | not yet. See *Later, if earned* |
+| what a page cannot compute for itself: a judgment about an image or a phrase | ask, one call | `pitch-agent` reading a manifest. Everything computable -- dominant colours, contrast, harmony, a type scale -- is arithmetic the browser does instantly and offline; the model only chooses and names |
 | showing what is running, and what is only *up* | none -- a script | `ward`. Every component already writes its state down; this is a rendering problem, not an observation one, and a model in it would be guessing at facts that are on disk |
 
 ## Why there is a server

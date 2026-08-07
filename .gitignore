@@ -11,3 +11,5 @@ sites/
 # Per-site build locks. mkdir(2) is the primitive; nothing here outlives a run.
 state/
 ward.log
+agent.log
+.agent.pid

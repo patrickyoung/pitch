@@ -14,7 +14,21 @@ want=$(cat 2>/dev/null || true)
 # continuation line as if it came from somewhere else.
 printf 'ask %s\n' "$(printf '%s' "$*" | tr '\n' ' ')" >>"${STUB_LOG:-/dev/null}"
 
+# A model that answers with prose where an object was asked for -- the one
+# thing the interpreter must never pass through to a page.
+#
+# Two ways in, because there are two ways to reach this stub. $STUB_PROSE is
+# for a caller that owns the server's environment, which means starting a
+# second interpreter; the body marker is for one that only owns the request. A
+# variable set on a curl call reaches curl and nothing else, and that mistake
+# is easy enough to make twice.
+[ -n "${STUB_PROSE:-}" ] && { printf 'Certainly! Here are some lovely colours.\n'; exit 0; }
+case $want in *'"prose"'*) printf 'Certainly! Here are some lovely colours.\n'; exit 0 ;; esac
+
 case " $* " in
+*"say something"*)
+	printf '{"mood":"calm","palette":["#111","#eee"]}\n'
+	;;
 *"Describe the attached image"*)
 	# A picture becomes words exactly once, at the edge. Nothing downstream
 	# ever sees the image, so this is the whole of the conversion.

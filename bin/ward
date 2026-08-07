@@ -149,6 +149,24 @@ else
 	add tailscale down "no tailnet, so every URL is loopback"
 fi
 
+# ------------------------------------------------------------------- agent
+# The capability interpreter. Counted separately from the static server because
+# it is the one thing here that can spend money on a request, and a page that
+# cannot reach it fails in a way its author will not have thought about.
+caps=0
+for d in "$ROOT"/sites/*/agent; do
+	[ -d "$d" ] || continue
+	for c in "$d"/*; do [ -f "$c" ] && caps=$((caps + 1)); done
+done
+if [ "$caps" -eq 0 ]; then
+	add agent ok "no site asks for one"
+elif curl -s -o /dev/null --max-time 3 "http://127.0.0.1:${PITCH_AGENT_PORT:-8788}/" 2>/dev/null ||
+	[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST "http://127.0.0.1:${PITCH_AGENT_PORT:-8788}/x/agent/y" 2>/dev/null)" != 000 ]; then
+	add agent ok "$caps capability(ies), tailnet only"
+else
+	add agent down "$caps capability(ies) and nothing serving them -- pitch up"
+fi
+
 # ------------------------------------------------------------------ builds
 # A lock with no work behind it is the orphan that ran for 23 hours.
 BUILDS='[]'
@@ -207,7 +225,10 @@ tally() { # tally FILE BUCKET
 for d in "$ROOT"/log/*/; do
 	[ -d "$d" ] || continue
 	nm=${d%/}; nm=${nm##*/}
-	for f in "$d"build-*.jsonl; do [ -f "$f" ] && tally "$f" "$nm"; done
+	for f in "$d"*.jsonl; do [ -f "$f" ] && tally "$f" "$nm"; done
+	# Runtime calls a page made for itself, kept apart from what it cost to
+	# build: they are different spending and only one has a budget.
+	for f in "$d"agent/*.jsonl; do [ -f "$f" ] && tally "$f" "$nm (agent)"; done
 done
 for f in "$ROOT"/.ask/*.jsonl; do [ -f "$f" ] && tally "$f" "(pitch itself)"; done
 for f in "$HROOT"/.ask/*.jsonl; do [ -f "$f" ] && tally "$f" "(chat)"; done

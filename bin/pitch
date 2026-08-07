@@ -640,6 +640,9 @@ cmd_ls() {
 
 cmd_open() {
 	if generated "${1:-}"; then die "${1:-} is generated -- it names this machine, its gateways and every site, and is never published"; fi
+	if [ -d "$ROOT/sites/${1:-}/agent" ]; then
+		die "${1:-} has capabilities in agent/, and an unauthenticated model endpoint on the public internet is somebody else spending your tokens. pitch has no accounts and refuses to grow them, so a site with an agent stays on the tailnet."
+	fi
 	[ $# -eq 1 ] || die "usage: pitch open <name>"
 	dir=$(site_dir "$1")
 	[ -d "$dir" ] || die "there is no site called $1"
@@ -671,6 +674,12 @@ desired() {
 		name=${d##*/}
 		valid_name "$name" || continue
 		printf '%s /%s http://127.0.0.1:%s/%s\n' "$PITCH_HTTPS_PORT" "$name" "$PITCH_PORT" "$name"
+		# Capabilities are reachable on the tailnet port and on no other. Funnel
+		# is keyed by port, so a published site cannot reach its own agent --
+		# that is the shape of the serve config, not a promise about this code.
+		[ -d "$d/agent" ] &&
+			printf '%s /%s/agent http://127.0.0.1:%s/%s/agent\n' \
+				"$PITCH_HTTPS_PORT" "$name" "$PITCH_AGENT_PORT" "$name"
 		[ -f "$d/.public" ] &&
 			printf '%s /%s http://127.0.0.1:%s/%s\n' "$PITCH_FUNNEL_PORT" "$name" "$PITCH_PORT" "$name"
 	done | sort
@@ -739,6 +748,14 @@ cmd_up() {
 		# Which pitch-serve this is, so `doctor` can notice later that the
 		# file has moved on and the process has not.
 		mtime "$BIN/pitch-serve" >"$ROOT/.serve.stamp"
+	fi
+	if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PITCH_AGENT_PORT/" 2>/dev/null; then
+		printf 'pitch-agent is already up on 127.0.0.1:%s\n' "$PITCH_AGENT_PORT"
+	else
+		BRIEF_PATH=$SELF/skills "$BIN/pitch-agent" -p "$PITCH_AGENT_PORT" \
+			>>"$ROOT/log/agent.log" 2>&1 &
+		printf '%s\n' "$!" >"$ROOT/.agent.pid"
+		printf 'pitch-agent on http://127.0.0.1:%s\n' "$PITCH_AGENT_PORT"
 		sleep 0.3
 		kill -0 "$(cat "$pidfile")" 2>/dev/null || die "pitch-serve would not start -- see log/serve.log"
 		printf 'pitch-serve on http://127.0.0.1:%s\n' "$PITCH_PORT"
@@ -751,7 +768,8 @@ cmd_down() {
 	pidfile=$ROOT/.serve.pid
 	[ -f "$pidfile" ] || { printf 'nothing to stop\n'; return 0; }
 	kill "$(cat "$pidfile")" 2>/dev/null || true
-	rm -f "$pidfile" "$ROOT/.serve.stamp"
+	[ -f "$ROOT/.agent.pid" ] && kill "$(cat "$ROOT/.agent.pid")" 2>/dev/null
+	rm -f "$pidfile" "$ROOT/.serve.stamp" "$ROOT/.agent.pid"
 	printf 'stopped. The tailscale config is left alone; pitch reconcile rebuilds it.\n'
 }
 

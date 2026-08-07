@@ -37,6 +37,7 @@ load_config() {
 	: "${PITCH_PORT:=8787}"          # the static server, loopback only
 	: "${PITCH_HTTPS_PORT:=443}"     # tailnet-only, the default
 	: "${PITCH_FUNNEL_PORT:=8443}"   # reachable from the internet, opt-in
+	: "${PITCH_AGENT_PORT:=8788}"    # the capability interpreter, loopback only
 	# Match the model to the job. A slug and a classification are cheap
 	# questions; writing a whole app is not, and -m is per call.
 	: "${PITCH_MODEL:=}"             # writes the app
@@ -53,7 +54,7 @@ load_config() {
 	: "${PITCH_TAILSCALE:=}"
 	export PITCH_PORT PITCH_HTTPS_PORT PITCH_FUNNEL_PORT PITCH_MODEL
 	export PITCH_SMALL_MODEL PITCH_CYCLES PITCH_CMD_TIMEOUT PITCH_PAGE_TIMEOUT
-	export PITCH_BUDGET PITCH_BUILD_MAX
+	export PITCH_BUDGET PITCH_BUILD_MAX PITCH_AGENT_PORT
 }
 
 # A site name becomes a path component, a URL path, a git repository, a

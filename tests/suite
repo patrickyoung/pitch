@@ -374,6 +374,94 @@ PITCH_ROOT=$NEWROOT ./bin/pitch doctor >/dev/null 2>&1 && no "doctor exited 0 wi
 rm -rf "$NEWROOT/state/wedged.lock"
 verdict
 
+try "a capability is data, and the interpreter refuses what it cannot check"
+# The builder writes these, so a capability must never be able to cause more
+# than one ask call with a prompt. Everything below is what stops a manifest
+# from becoming a program, an unbounded bill, or garbage in somebody's page.
+AG=$NEWROOT/sites/counter/agent
+mkdir -p "$AG" "$NEWROOT/log/counter/agent"
+cat >"$AG/good" <<'M'
+skill: web-house
+requires: mood palette
+prompt:
+say something
+M
+printf 'requires: mood\n' >"$AG/nopropmt"
+printf 'prompt:\nhi\n' >"$AG/nokeys"
+
+APF=$WORK/agentport
+PITCH_AGENT_PORT_FILE=$APF ASK=$ROOT/tests/ask-stub BRIEF_PATH=$ROOT/skills \
+	PITCH_ROOT=$NEWROOT ./bin/pitch-agent -p 0 >"$WORK/agent.log" 2>&1 &
+SERVE_PIDS="$SERVE_PIDS $!"
+n=0; while [ ! -s "$APF" ]; do n=$((n + 1)); [ "$n" -gt 100 ] && break; sleep 0.1; done
+AP=$(cat "$APF" 2>/dev/null)
+post() { curl -s -o "$WORK/ag.out" -w '%{http_code}' --max-time 30 -X POST \
+	-H 'content-type: application/json' --data "$2" \
+	"http://127.0.0.1:$AP/counter/agent/$1"; }
+
+[ -n "$AP" ] || no "the interpreter would not start"
+if [ -n "$AP" ]; then
+	[ "$(post nokeys '{}')" = 500 ] ||
+		no "a capability that names no required keys was accepted -- it can never fail honestly"
+	[ "$(post nopropmt '{}')" = 500 ] || no "a capability with no prompt was accepted"
+	[ "$(post missing '{}')" = 404 ] || no "an unknown capability was not 404"
+	# --path-as-is, or curl normalises the traversal away before it is sent and
+	# the case proves nothing. Anything but a refusal is a finding.
+	c=$(curl -s -o /dev/null -w '%{http_code}' --path-as-is --max-time 10 -X POST \
+		--data '{}' "http://127.0.0.1:$AP/counter/agent/../../../../etc/passwd")
+	case $c in 403 | 404) ;; *) no "a traversing capability name answered $c" ;; esac
+	c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+		"http://127.0.0.1:$AP/counter/agent/good")
+	[ "$c" = 405 ] || no "GET was not refused"
+
+	# Prose where the page expects an object is a broken app, not an answer.
+	# A second interpreter, because the stub is a child of the server and
+	# inherits the environment the *server* was started with -- setting a
+	# variable on curl reaches curl and nothing else.
+	PPF=$WORK/proseport
+	PITCH_AGENT_PORT_FILE=$PPF STUB_PROSE=1 ASK=$ROOT/tests/ask-stub BRIEF_PATH=$ROOT/skills \
+		PITCH_ROOT=$NEWROOT ./bin/pitch-agent -p 0 >"$WORK/prose.log" 2>&1 &
+	SERVE_PIDS="$SERVE_PIDS $!"
+	n=0; while [ ! -s "$PPF" ]; do n=$((n + 1)); [ "$n" -gt 100 ] && break; sleep 0.1; done
+	PP=$(cat "$PPF" 2>/dev/null)
+	c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+		-H 'content-type: application/json' --data '{}' \
+		"http://127.0.0.1:$PP/counter/agent/good")
+	[ "$c" = 502 ] || no "prose from the model answered $c instead of failing"
+
+	# Images: capped, and only the types it says it takes. The body goes
+	# through a file, because a 6 MB shell argument is longer than ARG_MAX and
+	# the first version of this measured that instead of the cap.
+	python3 -c 'import sys; sys.stdout.write("{\"image\":\"data:image/png;base64,%s\"}" % ("A"*5500000))' \
+		>"$WORK/big.json"
+	c=$(curl -s -o "$WORK/ag.out" -w '%{http_code}' --max-time 30 -X POST \
+		-H 'content-type: application/json' --data-binary @"$WORK/big.json" \
+		"http://127.0.0.1:$AP/counter/agent/good")
+	[ "$c" = 413 ] || no "an oversized image answered $c"
+	grep -qi image "$WORK/ag.out" 2>/dev/null ||
+		no "the refusal does not say it was the image: $(head -c 100 "$WORK/ag.out")"
+	[ "$(post good '{"image":"data:application/x-sh;base64,aGk="}')" = 415 ] ||
+		no "a shell script offered as an image was accepted"
+fi
+verdict
+
+try "capabilities are tailnet only, and a site with one cannot be published"
+# Funnel is keyed by port, so this is the shape of the serve config rather than
+# a promise: the agent path is added to 443 and to nothing else.
+want=$(PITCH_ROOT=$NEWROOT ./bin/pitch desired 2>/dev/null)
+printf '%s\n' "$want" | grep -q '^443 /counter/agent ' ||
+	no "the agent path is not served on the tailnet port"
+printf '%s\n' "$want" | grep -E '^(8443|[0-9]+) /counter/agent ' | grep -qv '^443 ' &&
+	no "the agent path is served on a port other than 443"
+: >"$NEWROOT/sites/counter/.public"
+out=$(PITCH_ROOT=$NEWROOT ./bin/pitch open counter 2>&1) && no "a site with capabilities was published"
+case $out in *agent*) ;; *) no "the refusal does not say why: $out" ;; esac
+rm -f "$NEWROOT/sites/counter/.public"
+# Put the tree back: a later case publishes this site, and a capability left
+# lying about would refuse it for a reason that has nothing to do with that case.
+rm -rf "$NEWROOT/sites/counter/agent"
+verdict
+
 try "ward reports what is down as down, and can change nothing"
 # A dashboard that says ok when nothing is running is worse than no dashboard:
 # every failure this system has had was a component that was up and not
