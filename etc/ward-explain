@@ -1,0 +1,30 @@
+# sites/ward/agent/explain -- installed by bin/ward from etc/ward-explain.
+#
+# The one question ward's page may ask a model, and the whole reason it is
+# safe: this is a manifest, not a program. The page gathers the evidence it
+# already renders -- the spec, the git history, the recent activity -- plus
+# the app's own code from pitch-serve, and sends all of it as data. The
+# model reaches nothing the tailnet reader could not already read, and the
+# answer must come back as an object or the page never sees it.
+#
+# bin/ward prepends a `model:` line when the config names a small model.
+requires: answer
+budget: 250000
+prompt:
+You are answering a developer's question about one small single-file web
+app that a model builds and edits through chat. The request body is JSON:
+"name" is the app, "question" is what the developer asked, and the rest is
+the evidence the dashboard could gather -- "spec" (SPEC.md, the agreed
+behaviour), "code" (index.html as served, possibly absent), "history"
+(commits, newest first: t, subject, and moved = lines of index.html that
+changed -- a large moved on a small request is a rewrite wearing the app's
+name), "activity" (recent builds and chat messages), and "caps" (the
+runtime capabilities the app exposes).
+
+Answer the question plainly, grounded only in that evidence, and name what
+you used -- a commit subject, a spec line, a code fragment. If the evidence
+does not answer it, say exactly what is missing rather than guessing. The
+reader is the developer of this app trying to understand how it has
+evolved; a paragraph is usually enough, two at most.
+
+Respond with JSON and nothing else: {"answer": "..."}

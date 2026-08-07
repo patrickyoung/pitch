@@ -141,6 +141,18 @@ Both are TLS from Tailscale's own `*.ts.net` certificate. Default is private.
   cannot be walked out of *because* it only reads files, and a static server
   that shells out to `docker` is not a static server. The cost is that the
   page can be stale, so it says how stale it is, which is the honest trade.
+
+  The page does drill down, and it does answer questions -- without bending
+  either rule. Per site, `state.json` carries the git history with the
+  moved-lines gauge per commit, the spec, and the recent builds and chat:
+  all of it read from what the system already writes, nothing newly
+  recorded. And the one question the page can ask a model goes through
+  `pitch-agent` as data -- `ward` installs `sites/ward/agent/explain`, a
+  manifest, and the page sends the evidence it already shows plus the app's
+  own code from `pitch-serve`. The model sees what a tailnet reader could
+  already read, the answer must come back as an object, and the spend is
+  bounded by the manifest's budget. Asking is reading; `ward` still cannot
+  act.
 - **No socket for the dashboard, and no metrics store.** The fastest thing
   worth seeing is a build starting; nobody perceives better than two seconds,
   so a WebSocket buys a property no human can detect and costs a live
