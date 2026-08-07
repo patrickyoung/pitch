@@ -1,10 +1,12 @@
-# lib/common.sh -- sourced by pitch and pitch-chat. Nothing here runs alone.
+# lib/common.sh -- sourced by pitch, pitch-chat and ward. Nothing here runs
+# alone.
 #
 # What lives here is what every program has to agree about: where the tree is,
-# what a usable site name is, and what URL a site has. A name validated in one
-# program and not another is how this becomes a remote shell, so there is
-# exactly one function that decides -- and bin/pitch-serve carries the same
-# rule as a regexp, with case 2 of the suite running both against one list.
+# what a usable site name is, what URL a site has, and what the tailscale
+# config should hold. A name validated in one program and not another is how
+# this becomes a remote shell, so there is exactly one function that decides
+# -- and bin/pitch-serve carries the same rule as a regexp, with case 2 of
+# the suite running both against one list.
 
 die() {
 	printf '%s: %s\n' "${0##*/}" "$*" >&2
@@ -122,4 +124,59 @@ logappend() {
 	mkdir -p "${p%/*}"
 	# A single printf is a single write(2), so two appenders cannot interleave.
 	printf '%s\n' "$(cat)" >>"$p"
+}
+
+# Desired state, computed from the tree. One line per handler, sorted, so two
+# runs of this produce the same bytes and a diff against what tailscale
+# currently holds is the whole of the reconcile.
+#
+# Here rather than in bin/pitch because ward asks the same question, and a
+# ward that had to exec `pitch desired` made pitch -> ward -> pitch the one
+# cycle in the system. These three only read; reconcile, which acts, stays
+# in pitch, because ward may never act.
+desired() {
+	[ -d "$ROOT/sites" ] || return 0
+	for d in "$ROOT/sites"/*; do
+		[ -d "$d" ] || continue
+		name=${d##*/}
+		valid_name "$name" || continue
+		printf '%s /%s http://127.0.0.1:%s/%s\n' "$PITCH_HTTPS_PORT" "$name" "$PITCH_PORT" "$name"
+		# Capabilities are reachable on the tailnet port and on no other. Funnel
+		# is keyed by port, so a published site cannot reach its own agent --
+		# that is the shape of the serve config, not a promise about this code.
+		[ -d "$d/agent" ] &&
+			printf '%s /%s/agent http://127.0.0.1:%s/%s/agent\n' \
+				"$PITCH_HTTPS_PORT" "$name" "$PITCH_AGENT_PORT" "$name"
+		[ -f "$d/.public" ] &&
+			printf '%s /%s http://127.0.0.1:%s/%s\n' "$PITCH_FUNNEL_PORT" "$name" "$PITCH_PORT" "$name"
+	done | sort
+}
+
+current() {
+	ts=$(tailscale_bin) || return 0
+	"$ts" serve status --json 2>/dev/null |
+		jq -r '(.Web // {}) | to_entries[] as $e
+			| ($e.key | split(":")[-1]) as $port
+			| ($e.value.Handlers // {}) | to_entries[]
+			| "\($port) \(.key) \(.value.Proxy // "")"' 2>/dev/null | sort
+}
+
+# What reconcile would change, without changing it. ward is read-only by
+# construction, so it needs a way to ask about drift that cannot cause any.
+drift() {
+	want=$(desired)
+	have=$(current)
+	printf '%s\n%s\n' "$want" "$have" | sort | uniq -u | grep . || true
+}
+
+# A shop container, found by the labels compose itself writes -- never by
+# container_name, which is a string a human can edit without either program
+# that reads it noticing, and the failure is ward going quietly blind, in
+# ward, which exists to catch exactly that. The service name is the
+# contract, and shop/compose.yaml says so where it is defined. Prints the
+# container id, or nothing.
+shop_container() {
+	command -v docker >/dev/null 2>&1 || return 1
+	docker ps -q --filter "label=com.docker.compose.project=shop" \
+		--filter "label=com.docker.compose.service=$1" 2>/dev/null | head -1
 }

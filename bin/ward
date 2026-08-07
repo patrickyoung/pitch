@@ -87,8 +87,11 @@ fi
 # effect on the next message, which is true of handlers and false of heed --
 # one long-running shell that parsed itself once.
 HROOT=${HAIL_ROOT:-$HOME/projects/hail}
-if [ -n "$(dockerq ps -q --filter name=^shop-heed$)" ]; then
-	started=$(dockerq inspect -f '{{.State.StartedAt}}' shop-heed)
+# By the labels compose itself writes, never by container_name: a renamed
+# container cannot quietly blind the one program whose job is noticing.
+heed_cid=$(shop_container heed || true)
+if [ -n "$heed_cid" ]; then
+	started=$(dockerq inspect -f '{{.State.StartedAt}}' "$heed_cid")
 	sat=$(epoch "${started:-}")
 	code=$(mtime "$HROOT/bin/heed" 2>/dev/null || echo 0)
 	if [ "$sat" -gt 0 ] && [ "$code" -gt "$sat" ]; then
@@ -108,7 +111,7 @@ fi
 # a question it can answer, and getChat does not disturb the long poll that
 # getUpdates holds.
 PROBE=$ROOT/state/ward.telegram
-if [ -n "$(dockerq ps -q --filter name=^shop-matterbridge$)" ] || pgrep -x matterbridge >/dev/null 2>&1; then
+if [ -n "$(shop_container matterbridge || true)" ] || pgrep -x matterbridge >/dev/null 2>&1; then
 	last=$(cat "$PROBE.at" 2>/dev/null || echo 0)
 	case $last in '' | *[!0-9]*) last=0 ;; esac
 	if [ $((NOW - last)) -ge "${PITCH_WARD_PROBE:-60}" ]; then
@@ -137,8 +140,11 @@ fi
 
 # --------------------------------------------------------------- tailscale
 if host=$(tailnet_host 2>/dev/null) && [ -n "$host" ]; then
-	n=$("$BIN/pitch" desired 2>/dev/null | grep -c . || true)
-	d=$("$BIN/pitch" drift 2>/dev/null | grep -c . || true)
+	# desired and drift come from lib/common.sh, called in-process: when they
+	# lived in bin/pitch this was `pitch desired`, and pitch ward -> ward ->
+	# pitch was the one cycle in the system.
+	n=$(desired 2>/dev/null | grep -c . || true)
+	d=$(drift 2>/dev/null | grep -c . || true)
 	if [ "${d:-0}" -gt 0 ]; then
 		add tailscale stale "$d path(s) differ from the tree -- pitch reconcile"
 	else
